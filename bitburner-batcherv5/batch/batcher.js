@@ -65,6 +65,12 @@ export async function main(ns) {
     // pids: pid -> { host, threads }. reserve: share of threads kept unlent;
     // it grows each time batches had to reclaim shared RAM, and eases back.
     share: { pids: new Map(), threads: 0, reserve: cfg.share?.reserveFraction ?? 0.1, reclaims: 0 },
+    // Script cap, tuned at runtime (see tuneSlots).
+    slots: { cap: cfg.maxWorkerScripts, phase: "idle", before: null, cooldown: 0, history: [] },
+    drifts: [], // recent drifts, for report.js
+    modeLog: [], // recent lane mode changes, for report.js
+    incomeLog: [], // { t, money } in 10 s buckets for the last 30 minutes
+    repairs: 0,
   };
   const buffer = () => 4 * st.spacing + Math.ceil(st.msPerExec * 8) + 2 * TICK;
 
@@ -114,7 +120,7 @@ export async function main(ns) {
       } catch (e) {
         st.lastError = { at: Date.now(), target: lane.target, message: String(e?.message ?? e) };
         ns.print(`ERROR on ${lane.target}: ${st.lastError.message}`);
-        lane.mode = "drain";
+        setMode(st, lane, "drain", "error");
         lane.firstLand = 0;
         cancelQueued(lane);
         requestReplan(st);
@@ -143,7 +149,9 @@ export async function main(ns) {
  */
 function startReplan(ns, cfg, st, ledger, b) {
   const now = Date.now();
-  stopSharing(ns, st); // the plan gets first claim on all RAM
+  // Sharing isn't stopped here: shared RAM counts as free for planning, and
+  // after the plan only the excess is taken back (see startSharing), so the
+  // rep boost doesn't dip at every replan.
   st.hosts = scanAll(ns).hosts;
   ledger.refresh(st.hosts);
   st.ramKey = ledger.hosts.map((h) => `${h.host}:${h.maxRam}`).join(",");
@@ -217,7 +225,7 @@ function startReplan(ns, cfg, st, ledger, b) {
     capacity,
     K,
     chunk: capacity / K,
-    maxInFlight: Math.max(1, Math.floor(cfg.maxWorkerScripts / 5)),
+    maxInFlight: Math.max(1, Math.floor(st.slots.cap / 5)),
     ci: 0,
     j: 0,
     started: now,
@@ -309,7 +317,7 @@ function finishPlan(ns, cfg, st, ledger) {
     let lane = st.lanes.get(c.t);
     if (lane && (lane.mode === "drain" || lane.mode === "retire")) {
       // Wanted again: once its workers have landed it re-preps with this budget.
-      lane.mode = "drain";
+      setMode(st, lane, "drain", "wanted again after retiring");
       lane.firstLand = 0;
       lane.m = c.m;
       lane.prepBudget = B;
@@ -324,7 +332,7 @@ function finishPlan(ns, cfg, st, ledger) {
         lane = newLane(c.t, "batch");
         st.lanes.set(c.t, lane);
       }
-      lane.mode = "batch";
+      setMode(st, lane, "batch", "planned");
       lane.m = c.m;
       lane.plan = plan;
       lane.budget = B;
@@ -343,7 +351,7 @@ function finishPlan(ns, cfg, st, ledger) {
   }
   for (const [t, lane] of st.lanes) {
     if (!keep.has(t) && lane.mode !== "retire") {
-      lane.mode = "retire";
+      setMode(st, lane, "retire", "no longer worth its RAM");
       cancelQueued(lane);
     }
   }
@@ -369,7 +377,64 @@ function finishPlan(ns, cfg, st, ledger) {
   const cycles = [...st.lanes.values()].filter((l) => l.m).map((l) => l.m.weakenTime + b);
   st.nextReplan = st.replanAsked ? now : now + Math.max(2000, Math.min(60000, ...cycles));
   st.replanAsked = false;
+  tuneSlots(ns, cfg, st);
   startSharing(ns, cfg, st, ledger);
+}
+
+/**
+ * Self-tuning script cap. More scripts allow more batches in flight, but a
+ * busier game runs workers later, which widens the landing gap, and a wider
+ * gap means each target lands batches less often. The planner's expected
+ * income already reflects the measured gap, so this is a hill climb on it:
+ * while slots are the limit, try 25% more; two plans later (once lateness
+ * has been measured under the new load) keep it if expected income rose,
+ * otherwise go back and wait a while before trying again. Stalls or heavy
+ * lateness bring the cap down.
+ */
+function tuneSlots(ns, cfg, st) {
+  if (!cfg.autoTuneSlots || !st.usage) return;
+  const T = st.slots;
+  let expected = 0;
+  for (const lane of st.lanes.values()) if (lane.mode === "batch" && lane.plan) expected += lane.plan.rate;
+  const L = st.lateStats;
+  const log = (what) => {
+    T.history.push({ at: Date.now(), cap: T.cap, what, expected: Math.round(expected * 1000) });
+    if (T.history.length > 20) T.history.shift();
+  };
+  // The game is struggling: back off whatever phase we're in.
+  if (L && L.p99 > cfg.spacingMaxMs / 2 && T.cap > cfg.maxWorkerScripts) {
+    T.cap = Math.max(cfg.maxWorkerScripts, Math.floor(T.cap * 0.8));
+    T.phase = "idle";
+    T.cooldown = 5;
+    log("lateness too high, lowered");
+    return;
+  }
+  if (T.phase === "probe1") {
+    T.phase = "probe2"; // let lateness settle under the new load
+    return;
+  }
+  if (T.phase === "probe2") {
+    if (expected >= T.before.expected * 1.01) {
+      log("kept: expected income rose");
+      T.phase = "idle";
+    } else {
+      T.cap = T.before.cap;
+      T.cooldown = 10;
+      T.phase = "idle";
+      log("reverted: no gain");
+    }
+    return;
+  }
+  if (T.cooldown > 0) {
+    T.cooldown--;
+    return;
+  }
+  if (st.usage.limit === "slots" && T.cap < cfg.maxWorkerScriptsLimit) {
+    T.before = { cap: T.cap, expected };
+    T.cap = Math.min(cfg.maxWorkerScriptsLimit, Math.ceil(T.cap * 1.25));
+    T.phase = "probe1";
+    log("trying more");
+  }
 }
 
 /**
@@ -398,9 +463,31 @@ function startSharing(ns, cfg, st, ledger) {
   // Ease the reserve back towards the configured level after a quiet plan.
   st.share.reserve = Math.max(cfg.share.reserveFraction, st.share.reserve * 0.9);
   const spareThreads = st.usage.capacity - needed - st.share.reserve * st.usage.capacity;
-  let ramLeft = spareThreads * ledger.threadRam;
-  if (ramLeft < shareRam) return;
+  const wantRam = Math.max(0, spareThreads * ledger.threadRam);
+  // Forget share workers that have ended (killed by hand, say), and stop
+  // home's share if home is batching again.
   ledger.refresh(st.hosts);
+  for (const [pid, info] of [...st.share.pids]) {
+    const gone = !ns.isRunning(pid);
+    if (gone || (info.home && !ledger.homeDedicated)) {
+      if (!gone) ns.kill(pid);
+      st.share.pids.delete(pid);
+      st.share.threads -= info.threads;
+      if (info.home) st.share.homeThreads = Math.max(0, (st.share.homeThreads ?? 0) - info.threads);
+    }
+  }
+  // Top up or trim what's already shared, rather than restarting it.
+  let haveRam = 0;
+  for (const info of st.share.pids.values()) if (!info.home) haveRam += info.threads * shareRam;
+  if (haveRam > wantRam + shareRam) {
+    stopSharing(ns, st, haveRam - wantRam, shareRam);
+    haveRam = 0;
+    for (const info of st.share.pids.values()) if (!info.home) haveRam += info.threads * shareRam;
+  }
+  ledger.refresh(st.hosts);
+  if (ledger.homeDedicated) shareHome(ns, cfg, st, shareRam);
+  let ramLeft = wantRam - haveRam;
+  if (ramLeft < shareRam) return;
   for (const h of [...ledger.hosts].sort((a, c) => c.cores - a.cores || c.free - a.free)) {
     const t = Math.floor(Math.min(h.free, ramLeft) / shareRam);
     if (t < 1) continue;
@@ -415,18 +502,45 @@ function startSharing(ns, cfg, st, ledger) {
   }
 }
 
+/**
+ * Fill home with share threads when it's dedicated to sharing, keeping
+ * share.homeKeepFree of it free for your own scripts. Tops up only.
+ */
+function shareHome(ns, cfg, st, shareRam) {
+  const s = ns.getServer("home");
+  const reserve = Math.max(cfg.homeReserveGB, s.maxRam * (cfg.share.homeKeepFree ?? 0.1));
+  const t = Math.floor((s.maxRam - s.ramUsed - reserve) / shareRam);
+  if (t < 1) return;
+  const pid = ns.exec(cfg.workers.share, "home", { threads: t, temporary: true });
+  if (pid > 0) {
+    st.share.pids.set(pid, { host: "home", threads: t, home: true });
+    st.share.threads += t;
+    st.share.homeThreads = (st.share.homeThreads ?? 0) + t;
+  }
+}
+
 /** Take shared RAM back: all of it, or (with ramNeeded) just enough, biggest first. */
 function stopSharing(ns, st, ramNeeded = Infinity, shareRam = 0) {
   let freed = 0;
-  const byBiggest = [...st.share.pids.entries()].sort((a, c) => c[1].threads - a[1].threads);
+  // A partial reclaim never touches home's dedicated share: batches can't use home then.
+  const byBiggest = [...st.share.pids.entries()].filter(([, i]) => ramNeeded === Infinity || !i.home).sort((a, c) => c[1].threads - a[1].threads);
   for (const [pid, info] of byBiggest) {
     if (freed >= ramNeeded) break;
+    if (info.home) st.share.homeThreads = Math.max(0, (st.share.homeThreads ?? 0) - info.threads);
     ns.kill(pid);
     st.share.pids.delete(pid);
     st.share.threads -= info.threads;
     freed += info.threads * shareRam;
   }
   if (st.share.pids.size === 0) st.share.threads = 0;
+}
+
+/** Change a lane's mode, keeping a short log of why (for report.js). */
+function setMode(st, lane, mode, why) {
+  if (lane.mode === mode) return;
+  st.modeLog.push({ at: Date.now(), target: lane.target, from: lane.mode, to: mode, why });
+  if (st.modeLog.length > 60) st.modeLog.shift();
+  lane.mode = mode;
 }
 
 /** Ask for a replan as soon as possible (after the one being built, if any). */
@@ -468,7 +582,7 @@ function cancelQueued(lane) {
 
 /** Values read once per tick and shared by every lane. */
 function tickContext(ns, st) {
-  return { player: st.useFormulas ? ns.getPlayer() : null, times: new Map() };
+  return { player: st.useFormulas ? ns.getPlayer() : null, times: new Map(), level: ns.getHackingLevel() };
 }
 
 function times(ns, ctx, t) {
@@ -489,7 +603,7 @@ function stepLane(ns, cfg, st, ledger, lane, now, b, TICK, ctx) {
     if (lane.pids.size === 0) {
       if (lane.mode === "retire") st.lanes.delete(t);
       else {
-        lane.mode = "prep";
+        setMode(st, lane, "prep", "workers landed, re-prep");
         lane.prep = null;
         requestReplan(st);
       }
@@ -500,7 +614,7 @@ function stepLane(ns, cfg, st, ledger, lane, now, b, TICK, ctx) {
   if (lane.mode === "prep") {
     if (lane.pids.size > 0) return 0; // a prep round is still landing
     if (isPrepped(ns, t)) {
-      lane.mode = "batch";
+      setMode(st, lane, "batch", "prepped");
       lane.firstLand = 0;
       lane.plan = null;
       lane.prep = null;
@@ -558,12 +672,23 @@ function stepLane(ns, cfg, st, ledger, lane, now, b, TICK, ctx) {
     const L = Math.max(lane.nextLand, now + tm.weaken + b - s, lane.lastLandEnd + s);
     // Create the batch only when its first weaken is due to launch.
     if (L + s - tm.weaken - b > look) break;
-    if (st.pids.size + queuedCount(st) + 4 > cfg.maxWorkerScripts) break;
+    if (st.pids.size + queuedCount(st) + 4 > st.slots.cap) break;
 
     const pctNow = samplePct(ns, lane, now);
     const pct = predictPct(ns, st, lane, ctx, L, pctNow);
-    const shape = shapeAt(m, plan.h, pct);
+    const topUp = lane.topUp ?? 0;
+    const shape = shapeAt(m, plan.h, pct, topUp, overshoot(lane));
+    const repairing = topUp > 0;
+    lane.topUp = 0;
+    // Batches already in flight will keep landing on the short money until
+    // this repair batch's grow lands; their shortfalls are expected, not new.
+    if (repairing) lane.repairLand = Math.max(lane.repairLand ?? 0, L + 2 * s);
     const batch = {
+      repair: repairing,
+      // A repair batch's own hack still lands on the short money.
+      expectShort: topUp,
+      plannedF: Math.min(1, plan.h * pct),
+      level: ctx.level,
       id: ++st.batchSeq,
       cancelled: false,
       launched: new Set(),
@@ -608,10 +733,26 @@ function queuedCount(st) {
 }
 
 /** One batch's threads, with grow sized for the hack % expected at landing. */
-function shapeAt(m, h, pct) {
-  const f = Math.min(1 - 1 / m.moneyMax, h * pct);
-  const g = m.growThreads(f);
+function shapeAt(m, h, pct, topUp = 0, over = 1) {
+  // over: how much more than predicted hacks have recently taken (level-ups
+  // the prediction missed), so the grow covers that too.
+  const f = Math.min(1 - 1 / m.moneyMax, h * pct * over);
+  // topUp: the money is already short by this fraction (a drift), so grow
+  // back from (1 - f)(1 - topUp) instead of (1 - f).
+  const g = m.growThreads(Math.min(1 - 1 / m.moneyMax, 1 - (1 - f) * (1 - topUp)));
   return { h, g, w1: Math.ceil((h * m.hackSec) / m.weakenPer), w2: Math.ceil((g * m.growSec) / m.weakenPer) };
+}
+
+/**
+ * How much more than planned this target's hacks have been taking: the 95th
+ * percentile of actual / planned over recent healthy batches, never below 1.
+ * Learned from the game, so no safety margin has to be guessed.
+ */
+function overshoot(lane) {
+  const r = lane.overRatios;
+  if (!r || r.length < 10) return 1;
+  const sorted = [...r].sort((a, c) => a - c);
+  return Math.max(1, sorted[Math.floor(sorted.length * 0.95)]);
 }
 
 /** Live hack % per thread, sampled only while the target is at min security. */
@@ -737,6 +878,13 @@ function handleReports(ns, cfg, st, port) {
       continue;
     }
     if (r.amount > 0) {
+      const bucket = Math.floor(Date.now() / 10000) * 10000;
+      const lastB = st.incomeLog[st.incomeLog.length - 1];
+      if (lastB && lastB.t === bucket) lastB.money += r.amount;
+      else {
+        st.incomeLog.push({ t: bucket, money: r.amount });
+        while (st.incomeLog.length && st.incomeLog[0].t < bucket - 1800000) st.incomeLog.shift();
+      }
       st.session.money += r.amount;
       if (lane) {
         lane.money += r.amount;
@@ -755,17 +903,54 @@ function handleReports(ns, cfg, st, port) {
         const pct = b.expectedPerThread / lane.m.moneyMax;
         // Pieces land one after another, each on what the previous left.
         const left = b.hackPieces.reduce((acc, t) => acc * Math.max(0, 1 - t * pct), 1);
-        const expected = lane.m.moneyMax * (1 - left);
-        if (b.hackGot < expected * 0.999) {
-          lane.mode = "drain";
-          lane.firstLand = 0;
-          lane.desyncs++;
-          st.session.desyncs++;
-          cancelQueued(lane);
-          // Widen the gap only if real timing lateness could have caused it
-          // (not a stall: re-prepping is the right fix for those).
-          const worst = st.lates.length ? Math.max(...st.lates) : 0;
-          if (fairTiming && 2 * worst > st.spacing) st.spacing = Math.min(cfg.spacingMaxMs, st.spacing * 2);
+        const expected = lane.m.moneyMax * (1 - left) * (1 - (b.expectShort ?? 0));
+        const knownShort = !b.repair && (lane.repairLand ?? 0) > b.land;
+        if (b.hackGot >= expected * 0.999 && b.plannedF > 0 && !b.repair) {
+          // Healthy: learn how far actual hacks run over the plan.
+          (lane.overRatios ??= []).push(b.hackGot / lane.m.moneyMax / b.plannedF);
+          if (lane.overRatios.length > 200) lane.overRatios.shift();
+        }
+        if (knownShort) {
+          // Landed before the repair arrived: expected, already being fixed.
+        } else if (b.hackGot < expected * 0.999) {
+          const short = 1 - b.hackGot / expected; // fraction the money was short by
+          const now = Date.now();
+          const drift = {
+            at: now,
+            target: lane.target,
+            short: +short.toFixed(4),
+            secOver: +(ns.getServerSecurityLevel(lane.target) - lane.m.minSec).toFixed(3),
+            money: +(ns.getServerMoneyAvailable(lane.target) / lane.m.moneyMax).toFixed(4),
+            levelUp: ns.getHackingLevel() - (b.level ?? ns.getHackingLevel()),
+            late: Math.round(r.late),
+            gap: st.spacing,
+            repairBatch: !!b.repair,
+            stalled: !fairTiming,
+          };
+          // A small money shortfall: keep batching, and have the next batch
+          // grow back the missing money as well. Draining costs two weaken
+          // times of no income; a repair costs a few extra grow threads.
+          // Drain only if it's large, or repairs aren't fixing it (a repair
+          // batch itself came up short).
+          const repairable = short <= cfg.repairMaxShortfall && !b.repair && lane.m;
+          if (repairable) {
+            lane.topUp = Math.max(lane.topUp ?? 0, short);
+            drift.action = "repair";
+            st.repairs++;
+          } else {
+            drift.action = "re-prep";
+            setMode(st, lane, "drain", "drift");
+            lane.firstLand = 0;
+            lane.desyncs++;
+            st.session.desyncs++;
+            cancelQueued(lane);
+            // Widen the gap only if real timing lateness could have caused it
+            // (not a stall: re-prepping is the right fix for those).
+            const worst = st.lates.length ? Math.max(...st.lates) : 0;
+            if (fairTiming && 2 * worst > st.spacing) st.spacing = Math.min(cfg.spacingMaxMs, st.spacing * 2);
+          }
+          st.drifts.push(drift);
+          if (st.drifts.length > 50) st.drifts.shift();
         }
       }
     }
@@ -844,14 +1029,19 @@ function publish(ns, cfg, st, ledger, b) {
     planStats: st.planStats ?? null,
     planning: !!st.planner,
     lastError: st.lastError ?? null,
-    share: { threads: st.share.threads, power: ns.getSharePower(), reserve: st.share.reserve, reclaims: st.share.reclaims },
+    share: { threads: st.share.threads, homeThreads: st.share.homeThreads ?? 0, homeDedicated: ledger.homeDedicated, power: ns.getSharePower(), reserve: st.share.reserve, reclaims: st.share.reclaims },
+    modeLog: st.modeLog.slice(-20),
+    incomeLog: st.incomeLog,
     usage: st.usage ?? null,
     buffer: b,
     capacity: st.capacity,
     totalRam: ledger.totalRam(),
     hosts: ledger.hosts.length,
     workers: st.pids.size,
-    maxWorkers: cfg.maxWorkerScripts,
+    maxWorkers: st.slots.cap,
+    slotTune: { phase: st.slots.phase, history: st.slots.history.slice(-6) },
+    drifts: st.drifts.slice(-10),
+    repairs: st.repairs,
     nextReplan: st.nextReplan,
     session: st.session,
     lanes,

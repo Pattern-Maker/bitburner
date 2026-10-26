@@ -77,8 +77,13 @@ without it, from how fast hack % has been rising.
 launch, and the weakens start first, so security can't be left raised.
 
 **Self-checking.** Every hack reports what it took. If a batch's hacks take
-less than planned, that lane stops, lets its batches land, re-preps, and
-resumes. Workers that would start while security is briefly raised wait (at
+less than planned, the money was short when they landed. A small shortfall
+(up to `repairMaxShortfall`, 25%) is repaired: the next batch grows back the
+missing money too, and batching never stops. A bigger one, or a repair that
+didn't work, makes that lane stop, let its batches land, re-prep and resume.
+Each lane also learns how far its hacks run over the plan (level-ups the
+prediction missed) and sizes its grows for that. Every drift is recorded with
+its cause for `report.js`. Workers that would start while security is briefly raised wait (at
 most two landing gaps) so their timing stays exact. The landing gap is kept at
 twice the worst lateness measured.
 
@@ -114,8 +119,16 @@ run batch/train.js --level hard       trivial | normal (default) | hard
 run batch/train.js --focus            faster, but takes over the screen
 ```
 
+**Script cap.** With `autoTuneSlots`, whenever script slots are what limits
+income the batcher tries a 25% higher cap. Two plans later, once lateness has
+been measured under the extra load, it keeps the raise only if expected
+income went up. It lowers the cap if the game starts lagging.
+
 **Sharing.** RAM the plan can't use is lent to your factions with
-`ns.share()`. While you do faction work, rep gain is multiplied by
+`ns.share()`. It's topped up and trimmed at each replan rather than restarted,
+so the boost doesn't dip. Once home is 10% or less of your total RAM, home
+stops batching and shares instead, keeping 10% of itself free for your
+scripts: its extra cores make each share thread count for more. While you do faction work, rep gain is multiplied by
 1 + ln(threads)/25 (a million threads is about +55%). If batches ever need
 the RAM, they take back just what they need, and the batcher lends less from
 then on, easing back over time. Turn it off with `share.enabled`.

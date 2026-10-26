@@ -91,7 +91,22 @@ export class Ledger {
     const { ns, cfg } = this;
     this.hosts = [];
     this.byName.clear();
+    // Once home is a small share of all your RAM, it's worth more as a
+    // dedicated share server (its extra cores make each share thread count
+    // for more) than as a sliver of batching RAM. The batcher runs the share.
+    const frac = cfg.share?.enabled ? cfg.share.dedicateHomeBelow ?? 0 : 0;
+    this.homeDedicated = false;
+    if (frac > 0) {
+      let total = 0;
+      for (const host of hostNames) {
+        if (host.startsWith("hacknet-")) continue;
+        const s = ns.getServer(host);
+        if (s.hasAdminRights && !(s.purchasedByPlayer && host !== "home" && !cfg.usePurchasedServers)) total += s.maxRam;
+      }
+      this.homeDedicated = ns.getServerMaxRam("home") <= frac * total;
+    }
     for (const host of hostNames) {
+      if (host === "home" && this.homeDedicated) continue;
       if (host.startsWith("hacknet-")) continue; // their RAM makes hashes
       const s = ns.getServer(host);
       if (!s.hasAdminRights || s.maxRam <= 0) continue;

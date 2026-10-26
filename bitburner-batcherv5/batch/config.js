@@ -32,9 +32,20 @@ export const CONFIG = {
   // targets (60 = steps of 1/60th). Higher is more precise but slower to plan.
   planChunks: 60,
 
-  // Most worker scripts allowed to run at once. Thousands of tiny scripts can
-  // slow the game down; raise this if your machine copes, lower it if it lags.
+  // Worker script cap. With autoTuneSlots the batcher tries raising it while
+  // script slots are what limits income, keeps a raise only if expected
+  // income goes up once lateness has been measured under the extra load, and
+  // lowers it if the game starts lagging. maxWorkerScripts is where it starts
+  // (and the lowest it goes); maxWorkerScriptsLimit is the most it will try.
   maxWorkerScripts: 30000,
+  maxWorkerScriptsLimit: 200000,
+  autoTuneSlots: true,
+
+  // A batch whose hacks came up short by at most this fraction is repaired
+  // (the next batch grows back the missing money) instead of re-prepping the
+  // target, which costs two weaken times of no income. Bigger drifts, or a
+  // repair batch that is itself short, still re-prep.
+  repairMaxShortfall: 0.25,
 
   // How often the crawler rescans the network and tries to root servers.
   crawlIntervalMs: 30000,
@@ -84,6 +95,11 @@ export const CONFIG = {
   share: {
     enabled: true,
     reserveFraction: 0.1,
+    // Once home is at most this share of all your RAM, home stops batching
+    // and shares instead (its cores make each share thread worth more).
+    dedicateHomeBelow: 0.1,
+    // When home is dedicated, keep this share of it free for your own scripts.
+    homeKeepFree: 0.1,
   },
 
   // Coding contract solver (contracts.js): how often to look for new ones.

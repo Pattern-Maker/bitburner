@@ -40,7 +40,8 @@ function render(ns, f, money) {
     const elapsed = Math.max(1, (now - s.start) / 1000);
     ns.print(`== Batcher ==   ${b.formulas ? "Formulas.exe: exact + level prediction" : "no Formulas.exe: live values"}`);
     ns.print(`  RAM         ${f.ram(b.totalRam)} on ${b.hosts} servers = ${f.number(b.capacity, 0)} worker threads`);
-    ns.print(`  Workers     ${f.number(b.workers, 0)} running (cap ${f.number(b.maxWorkers, 0)})`);
+    const tune = b.slotTune && b.slotTune.phase !== "idle" ? ", trying a higher cap" : "";
+    ns.print(`  Workers     ${f.number(b.workers, 0)} running (cap ${f.number(b.maxWorkers, 0)}${tune})`);
     if (b.usage && b.usage.capacity > 0) {
       const u = b.usage;
       ns.print(`  In use      ${f.percent(u.used / u.capacity, 0)} of threads, ${f.number(u.slotsUsed, 0)} / ${f.number(u.slots, 0)} batch slots`);
@@ -53,7 +54,8 @@ function render(ns, f, money) {
     }
     if (b.share) {
       const sh = b.share;
-      if (sh.threads > 0) ns.print(`  Sharing     ${f.number(sh.threads, 0)} spare threads: faction rep x${sh.power.toFixed(3)} while you work for a faction`);
+      const homeNote = sh.homeDedicated ? ` (home dedicated: ${f.number(sh.homeThreads ?? 0, 0)})` : "";
+      if (sh.threads > 0) ns.print(`  Sharing     ${f.number(sh.threads, 0)} spare threads${homeNote}: faction rep x${sh.power.toFixed(3)} while you work for a faction`);
       else if (sh.reserve > 0.11) ns.print(`  Sharing     holding back ${f.percent(sh.reserve, 0)} of threads after batches needed RAM`);
     }
     ns.print(`  Timing      ${b.spacing} ms gap, ${b.buffer} ms launch buffer, replan in ${f.time(Math.max(0, b.nextReplan - now))}`);
@@ -107,6 +109,7 @@ function render(ns, f, money) {
     ns.print(`  Session     ${money(s.money)} in ${f.time(elapsed * 1000)}  (${money(s.money / elapsed)}/s)`);
     const notes = [];
     if (s.desyncs) notes.push(`${s.desyncs} re-preps`);
+    if (b.repairs) notes.push(`${b.repairs} drifts repaired without re-prep`);
     if (s.aborted) notes.push(`${s.aborted} late hacks skipped`);
     if (notes.length) ns.print(`              ${notes.join(", ")}`);
   }

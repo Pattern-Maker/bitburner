@@ -58,6 +58,32 @@ export async function main(ns) {
       } else out(`  - ${st}${l.prep ? ` prep W${l.prep.w1} G${l.prep.g} W${l.prep.w2}` : ""}`);
     }
     out(`  expected total $${num(expected)}/s`);
+    if (b.slotTune?.history?.length) {
+      out(`  script cap tuning (${b.slotTune.phase}):`);
+      for (const h of b.slotTune.history) out(`    ${Math.round((now - h.at) / 1000)}s ago cap ${h.cap}: ${h.what} (expected $${num(h.expected)}/s)`);
+    }
+    if (b.drifts?.length) {
+      out(`  recent drifts (repaired ${b.repairs ?? 0} in total):`);
+      for (const d of b.drifts) {
+        out(`    ${Math.round((now - d.at) / 1000)}s ago ${d.target}: short ${(d.short * 100).toFixed(2)}% -> ${d.action}; sec+${d.secOver} money ${(d.money * 100).toFixed(1)}% levelUp ${d.levelUp} late ${d.late}ms gap ${d.gap}${d.repairBatch ? " (repair batch)" : ""}${d.stalled ? " (after a stall)" : ""}`);
+      }
+    }
+    if (b.modeLog?.length) {
+      out(`  recent target changes:`);
+      for (const m of b.modeLog) out(`    ${Math.round((now - m.at) / 1000)}s ago ${m.target}: ${m.from} -> ${m.to} (${m.why})`);
+    }
+    if (b.incomeLog?.length) {
+      // Per-minute income for the last 30 minutes, to show idle stretches.
+      const perMin = new Map();
+      for (const e of b.incomeLog) {
+        const k = Math.floor((now - e.t) / 60000);
+        perMin.set(k, (perMin.get(k) ?? 0) + e.money);
+      }
+      const row = [];
+      for (let k = 29; k >= 0; k--) row.push(num((perMin.get(k) ?? 0) / 60));
+      out(`  income per second, each minute from 30 min ago to now:`);
+      out(`    ${row.join(" ")}`);
+    }
   }
 
   // ---- the rest ----
