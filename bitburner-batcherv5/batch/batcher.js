@@ -1,0 +1,765 @@
+import { CONFIG } from "./config.js";
+import { scanAll, Ledger, buildModel, prepNeeds, solveStream, prepShape, isPrepped, drainPort } from "./lib.js";
+
+/**
+ * Continuous, multi-target HWGW batcher.
+ *
+ * Each target gets a "lane". A batching lane lands one batch every P ms, and
+ * every worker is launched just in time (its landing time minus its own
+ * duration), so RAM is only held while a worker is actually running.
+ *
+ * Replanning (once per pipeline cycle, or when RAM / rooted servers change):
+ *   - rank targets by income, discounted by how long they'd take to prep
+ *   - give the best target the threads its equilibrium needs, the next best
+ *     what's left, and so on (spillover); unprepped targets get prep threads
+ *   - new plans only apply to batches created afterwards: nothing already in
+ *     flight is ever resized or moved
+ *
+ * Every hack reports how much it took. If a hack takes less than planned, the
+ * target drifted (out-of-order landing, or a level-up the plan didn't see), so
+ * that lane stops, lets its batches land, re-preps and carries on.
+ * @param {NS} ns
+ */
+export async function main(ns) {
+  ns.disableLog("ALL");
+  const cfg = CONFIG;
+  const W = cfg.workers;
+  const files = Object.values(W);
+  for (const f of files) {
+    if (!ns.fileExists(f, "home")) {
+      ns.tprint(`ERROR batcher: missing worker ${f} on home`);
+      return;
+    }
+  }
+  const scriptRam = {
+    hack: ns.getScriptRam(W.hack, "home"),
+    grow: ns.getScriptRam(W.grow, "home"),
+    weaken: ns.getScriptRam(W.weaken, "home"),
+  };
+  const port = cfg.ports.reports;
+  ns.clearPort(port);
+  const ledger = new Ledger(ns, cfg, scriptRam, files);
+
+  const TICK = 10; // ms between loop passes; workers time themselves, so this only sets launch lookahead
+  const st = {
+    spacing: cfg.spacingStartMs,
+    msPerExec: 1,
+    lanes: new Map(), // target -> lane
+    pids: new Map(), // pid -> { target, kind, threads, batch }
+    hosts: [],
+    lates: [],
+    pendingExp: [], // { land, exp } from formulas, for level prediction
+    pendingExpTotal: 0, // running sum of pendingExp, so prediction is O(1) per batch
+    nextReplan: 0,
+    capacity: 0,
+    ramKey: "",
+    useFormulas: false,
+    batchSeq: 0,
+    session: { start: Date.now(), money: 0, desyncs: 0, batches: 0, aborted: 0 },
+    // Stalls: the whole game paused (background tab throttled, autosave, PC
+    // asleep). Workers alive during one land late through no fault of the
+    // timing, so their lateness is ignored.
+    lastStallAt: 0,
+    stalls: { count: 0, lastMs: 0, lastAt: 0 },
+  };
+  const buffer = () => 4 * st.spacing + Math.ceil(st.msPerExec * 8) + 2 * TICK;
+
+  let lastRefresh = 0;
+  let lastSweep = 0;
+  let lastPublish = 0;
+
+  let lastLoop = Date.now();
+  while (true) {
+    const now = Date.now();
+    // The loop sleeps 10 ms; if it slept for a second or more, the game stalled.
+    if (now - lastLoop > 1000) {
+      st.lastStallAt = now;
+      st.stalls.count++;
+      st.stalls.lastMs = now - lastLoop;
+      st.stalls.lastAt = now;
+      st.lates = [];
+    }
+    lastLoop = now;
+
+    // Keep free RAM current; notice purchases, upgrades and new roots.
+    if (now - lastRefresh >= 200 || st.hosts.length === 0) {
+      if (st.hosts.length === 0) st.hosts = scanAll(ns).hosts;
+      ledger.refresh(st.hosts);
+      const key = ledger.hosts.map((h) => `${h.host}:${h.maxRam}`).join(",");
+      const formulas = ns.fileExists("Formulas.exe", "home");
+      if (st.ramKey && (key !== st.ramKey || formulas !== st.useFormulas)) requestReplan(st);
+      st.ramKey = key;
+      st.useFormulas = formulas;
+      lastRefresh = now;
+    }
+
+    handleReports(ns, cfg, st, port);
+
+    // Planning runs a few ms per tick so it never delays launches.
+    if (st.planner) stepPlanner(ns, cfg, st, ledger, 4);
+    else if (now >= st.nextReplan) startReplan(ns, cfg, st, ledger, buffer());
+
+    const execT0 = Date.now();
+    let execs = 0;
+    const ctx = tickContext(ns, st);
+    for (const lane of [...st.lanes.values()]) {
+      execs += stepLane(ns, cfg, st, ledger, lane, now, buffer(), TICK, ctx);
+    }
+    if (execs > 0) st.msPerExec = 0.8 * st.msPerExec + 0.2 * Math.max(0.05, (Date.now() - execT0) / execs);
+
+    if (now - lastSweep >= 500) {
+      sweep(ns, st);
+      lastSweep = now;
+    }
+    if (now - lastPublish >= 500) {
+      publish(ns, cfg, st, ledger, buffer());
+      lastPublish = now;
+    }
+    await ns.sleep(TICK);
+  }
+}
+
+// ------------------------------------------------------------------ plan ---
+
+/**
+ * Start a replan. The cheap parts happen now; the expensive part (an income
+ * curve per target) is spread across ticks by stepPlanner, so planning never
+ * blocks launches long enough to make workers late.
+ */
+function startReplan(ns, cfg, st, ledger, b) {
+  const now = Date.now();
+  st.hosts = scanAll(ns).hosts;
+  ledger.refresh(st.hosts);
+  st.ramKey = ledger.hosts.map((h) => `${h.host}:${h.maxRam}`).join(",");
+  st.capacity = ledger.capacityThreads();
+
+  // Landing gap: twice the worst lateness seen since the last replan (ignoring
+  // the slowest 1% once there are plenty of samples, so a one-off hiccup
+  // doesn't widen it for everyone). With too few samples to judge, it eases
+  // back down, so it can never get stuck wide because a wide gap means few
+  // batches and so few samples. Never above spacingMaxMs.
+  if (st.lates.length >= 20) {
+    const sorted = [...st.lates].sort((a, c) => a - c);
+    const at = (q) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))];
+    const worst = sorted.length >= 100 ? at(0.99) : sorted[sorted.length - 1];
+    st.lateStats = { p50: at(0.5), p99: at(0.99), max: sorted[sorted.length - 1], n: sorted.length, at: now };
+    st.spacing = Math.ceil(Math.max(2 * worst, 0.8 * st.spacing));
+    st.lates = [];
+  } else {
+    st.spacing = Math.floor(0.8 * st.spacing);
+  }
+  st.spacing = Math.min(cfg.spacingMaxMs, Math.max(cfg.spacingMinMs, st.spacing));
+
+  const level = ns.getHackingLevel();
+  const valid = st.hosts.filter(
+    (h) =>
+      h !== "home" &&
+      ns.hasRootAccess(h) &&
+      ns.getServerMaxMoney(h) > 0 &&
+      ns.getServerRequiredHackingLevel(h) <= level &&
+      !ns.getServer(h).purchasedByPlayer,
+  );
+  // Quick pre-filter so curves are only built for the likeliest targets.
+  const quick = (h) => (ns.getServerMaxMoney(h) * ns.hackAnalyzeChance(h)) / ns.getWeakenTime(h);
+  const short = valid
+    .map((h) => ({ h, q: quick(h) }))
+    .sort((a, c) => c.q - a.q)
+    .slice(0, cfg.maxTargets)
+    .map((x) => x.h);
+  for (const t of st.lanes.keys()) if (valid.includes(t) && !short.includes(t)) short.push(t);
+
+  // Threads our draining/retiring lanes still hold are not free for anyone
+  // else until those workers land.
+  const held = new Map();
+  for (const info of st.pids.values()) held.set(info.target, (held.get(info.target) ?? 0) + info.threads);
+  let reserved = 0;
+  for (const [t, lane] of st.lanes) if (lane.mode === "drain" || lane.mode === "retire") reserved += held.get(t) ?? 0;
+  const capacity = Math.max(0, st.capacity - reserved);
+
+  const N = cfg.switchPaybackCycles;
+  const cands = short.map((t) => {
+    const m = buildModel(ns, t, st.useFormulas);
+    const lane = st.lanes.get(t);
+    const ready = lane ? lane.mode === "batch" : isPrepped(ns, t);
+    return {
+      t,
+      m,
+      ready,
+      batching: !!lane && lane.mode === "batch",
+      need: ready ? null : prepNeeds(ns, m),
+      weakenNow: ns.getWeakenTime(t),
+      horizon: N * (m.weakenTime + b),
+      curve: [],
+    };
+  });
+
+  // Curve resolution: K chunks of the capacity.
+  const K = Math.max(1, Math.min(cfg.planChunks, capacity));
+  st.planner = {
+    b,
+    cands,
+    capacity,
+    K,
+    chunk: capacity / K,
+    maxInFlight: Math.max(1, Math.floor(cfg.maxWorkerScripts / 5)),
+    ci: 0,
+    j: 0,
+    started: now,
+    ticks: 0,
+  };
+}
+
+/** Income per ms a target would make with `budget` threads (0 if none). */
+function curveValue(st, cfg, P, c, budget) {
+  if (budget < 1) return 0;
+  // Script slots are a second limited resource. Each chunk of threads comes
+  // with the same share of the slots, so a target can't assume it has them all.
+  const plan = solveStream(c.m, Math.floor(budget), st.spacing, P.b, slotShare(P, budget));
+  if (!plan) return 0;
+  let v = plan.rate;
+  if (!c.ready) {
+    // It has to be prepped first: discount by the prep time this budget implies.
+    const rounds = c.need.total > 0 ? Math.ceil(c.need.total / Math.floor(budget)) : 0;
+    v *= c.horizon / (c.horizon + rounds * c.weakenNow);
+  }
+  if (c.batching) v *= 1 + 1 / cfg.switchPaybackCycles; // keep what's running unless clearly beaten
+  return v;
+}
+
+/** In-flight batch slots that go with a thread budget. */
+function slotShare(P, budget) {
+  return Math.max(1, Math.floor((P.maxInFlight * budget) / Math.max(1, P.capacity)));
+}
+
+/** Build curve points until this tick's time budget runs out. Returns true when done. */
+function stepPlanner(ns, cfg, st, ledger, msBudget) {
+  const P = st.planner;
+  const t0 = Date.now();
+  P.ticks++;
+  while (P.ci < P.cands.length) {
+    if (Date.now() - t0 >= msBudget) return false;
+    const c = P.cands[P.ci];
+    c.curve[P.j] = curveValue(st, cfg, P, c, P.j * P.chunk);
+    // Past the point where more threads stop helping, the curve is flat:
+    // fill the rest without solving.
+    if (P.j >= 2 && c.curve[P.j] <= c.curve[P.j - 1] * (1 + 1e-9) && c.curve[P.j - 1] <= c.curve[P.j - 2] * (1 + 1e-9) && c.curve[P.j] > 0) {
+      for (let k = P.j + 1; k <= P.K; k++) c.curve[k] = c.curve[P.j];
+      P.j = P.K + 1;
+    } else P.j++;
+    if (P.j > P.K) {
+      P.ci++;
+      P.j = 0;
+    }
+  }
+  finishPlan(ns, cfg, st, ledger);
+  return true;
+}
+
+/**
+ * Marginal allocation: hand out the capacity a chunk at a time, each to the
+ * target that gains the most income from it. Because a batch needs a minimum
+ * number of threads before it earns anything, each step looks ahead: it picks
+ * the target and number of chunks with the best average gain per chunk.
+ * At the end every target sits where one more chunk would earn about the
+ * same anywhere, which is where income across all targets is highest.
+ */
+function finishPlan(ns, cfg, st, ledger) {
+  const P = st.planner;
+  st.planner = null;
+  const now = Date.now();
+  const b = P.b;
+  const alloc = P.cands.map(() => 0); // chunks per candidate
+  let left = P.K;
+  while (left > 0) {
+    let best = null;
+    P.cands.forEach((c, i) => {
+      const a = alloc[i];
+      const base = c.curve[a] ?? 0;
+      for (let j = 1; j <= left && a + j <= P.K; j++) {
+        const gain = ((c.curve[a + j] ?? 0) - base) / j;
+        if (gain > 0 && (!best || gain > best.gain)) best = { i, j, gain };
+      }
+    });
+    if (!best) break; // nobody gains from more threads
+    alloc[best.i] += best.j;
+    left -= best.j;
+  }
+
+  const order = P.cands.map((c, i) => ({ c, B: Math.floor(alloc[i] * P.chunk), v: c.curve[alloc[i]] ?? 0 })).sort((x, y) => y.v - x.v);
+  let inFlightLeft = P.maxInFlight;
+  const keep = new Set();
+  for (const { c, B } of order) {
+    if (B < 1) continue;
+    let lane = st.lanes.get(c.t);
+    if (lane && (lane.mode === "drain" || lane.mode === "retire")) {
+      // Wanted again: once its workers have landed it re-preps with this budget.
+      lane.mode = "drain";
+      lane.firstLand = 0;
+      lane.m = c.m;
+      lane.prepBudget = B;
+      lane.budget = B;
+      keep.add(c.t);
+      continue;
+    }
+    if (c.ready) {
+      const plan = solveStream(c.m, B, st.spacing, b, Math.min(inFlightLeft, slotShare(P, B)));
+      if (!plan) continue;
+      if (!lane) {
+        lane = newLane(c.t, "batch");
+        st.lanes.set(c.t, lane);
+      }
+      lane.mode = "batch";
+      lane.m = c.m;
+      lane.plan = plan;
+      lane.budget = B;
+      inFlightLeft -= plan.inFlight;
+      keep.add(c.t);
+    } else {
+      if (!lane) {
+        lane = newLane(c.t, "prep");
+        st.lanes.set(c.t, lane);
+      }
+      lane.m = c.m;
+      lane.prepBudget = Math.min(B, c.need.total);
+      lane.budget = B;
+      keep.add(c.t);
+    }
+  }
+  for (const [t, lane] of st.lanes) {
+    if (!keep.has(t) && lane.mode !== "retire") {
+      lane.mode = "retire";
+      cancelQueued(lane);
+    }
+  }
+  st.planStats = { ms: now - P.started, ticks: P.ticks, targets: P.cands.length, at: now };
+  // How much of the capacity the plan can actually use. If a lot is left over,
+  // RAM isn't what's limiting income (targets or script slots are), so buying
+  // more would be wasted; the buyer reads this.
+  let used = 0;
+  for (const lane of st.lanes.values()) {
+    if (!keep.has(lane.target)) continue;
+    used += lane.mode === "batch" && lane.plan ? lane.plan.conc : lane.budget ?? 0;
+  }
+  st.usage = { used, capacity: st.capacity, slotsUsed: P.maxInFlight - inFlightLeft, slots: P.maxInFlight };
+
+  // Replan once per pipeline cycle (the shortest weaken time among lanes),
+  // or straight away if something asked for one while this plan was built.
+  const cycles = [...st.lanes.values()].filter((l) => l.m).map((l) => l.m.weakenTime + b);
+  st.nextReplan = st.replanAsked ? now : now + Math.max(2000, Math.min(60000, ...cycles));
+  st.replanAsked = false;
+}
+
+/** Ask for a replan as soon as possible (after the one being built, if any). */
+function requestReplan(st) {
+  if (st.planner) st.replanAsked = true;
+  else st.nextReplan = 0;
+}
+
+function newLane(target, mode) {
+  return {
+    target,
+    mode,
+    m: null,
+    plan: null,
+    prepBudget: 0,
+    prep: null,
+    nextLand: 0,
+    lastLandEnd: 0,
+    queues: { weaken: [], grow: [], hack: [] },
+    batches: new Map(),
+    pids: new Set(),
+    money: 0,
+    started: Date.now(),
+    firstLand: 0, // when the first batch of this batching run lands
+    income: [], // { t, amount } for the last minute, for the status window
+    pctSamples: [],
+    desyncs: 0,
+  };
+}
+
+function cancelQueued(lane) {
+  for (const q of Object.values(lane.queues)) {
+    for (const op of q) op.batch.cancelled = true;
+    q.length = 0;
+  }
+}
+
+// ------------------------------------------------------------------ lanes ---
+
+/** Values read once per tick and shared by every lane. */
+function tickContext(ns, st) {
+  return { player: st.useFormulas ? ns.getPlayer() : null, times: new Map() };
+}
+
+function times(ns, ctx, t) {
+  let v = ctx.times.get(t);
+  if (!v) {
+    v = { hack: ns.getHackTime(t), grow: ns.getGrowTime(t), weaken: ns.getWeakenTime(t) };
+    ctx.times.set(t, v);
+  }
+  return v;
+}
+
+function stepLane(ns, cfg, st, ledger, lane, now, b, TICK, ctx) {
+  const t = lane.target;
+  const look = now + 2 * TICK;
+  let execs = 0;
+
+  if (lane.mode === "retire" || lane.mode === "drain") {
+    if (lane.pids.size === 0) {
+      if (lane.mode === "retire") st.lanes.delete(t);
+      else {
+        lane.mode = "prep";
+        lane.prep = null;
+        requestReplan(st);
+      }
+    }
+    return 0;
+  }
+
+  if (lane.mode === "prep") {
+    if (lane.pids.size > 0) return 0; // a prep round is still landing
+    if (isPrepped(ns, t)) {
+      lane.mode = "batch";
+      lane.firstLand = 0;
+      lane.plan = null;
+      lane.prep = null;
+      requestReplan(st); // get it a batch plan
+      return 0;
+    }
+    const m = lane.m;
+    const need = prepNeeds(ns, m);
+    // Size the round to what is free right now, then make sure all three parts
+    // fit together before launching any: a grow without its weaken would push
+    // security up with nothing to bring it back down. Halve until it fits.
+    const freeNow = ledger.hosts.reduce((acc, h) => acc + Math.floor(h.free / ledger.threadRam), 0);
+    let budget = Math.min(lane.prepBudget, need.total, freeNow);
+    let shape = null;
+    let pieces = null;
+    for (let tries = 0; tries < 8 && budget >= 1; tries++, budget = Math.floor(budget / 2)) {
+      shape = prepShape(budget, need, m);
+      if (shape.total <= 0) break;
+      pieces = ledger.planAll([
+        { kind: "weaken", amount: shape.w1 },
+        { kind: "weaken", amount: shape.w2 },
+        { kind: "grow", amount: shape.g },
+      ]);
+      if (pieces) break;
+    }
+    lane.prep = shape;
+    if (!shape || shape.total <= 0 || !pieces) return 0;
+    const land = now + ns.getWeakenTime(t) + b;
+    const batch = { id: ++st.batchSeq, cancelled: false, launched: new Set(), land };
+    const s = st.spacing;
+    // Weakens first: if the grow then fails to start, nothing is harmed.
+    execs += launch(ns, cfg, st, ledger, lane, { kind: "weaken", amount: shape.w1, land, batch, tag: "W1", wait: false, pieces: pieces[0] });
+    execs += launch(ns, cfg, st, ledger, lane, { kind: "weaken", amount: shape.w2, land: land + 2 * s, batch, tag: "W2", wait: false, pieces: pieces[1] });
+    if (shape.w2 > 0 && !batch.launched.has("W2")) return execs;
+    execs += launch(ns, cfg, st, ledger, lane, { kind: "grow", amount: shape.g, land: land + s, batch, tag: "G", wait: false, pieces: pieces[2] });
+    if (st.useFormulas && ctx.player && m.server) {
+      // Prep workers give exp too; count it so batches elsewhere predict levels right.
+      const exp = ns.formulas.hacking.hackExp(m.server, ctx.player) * shape.total;
+      st.pendingExp.push({ land, exp });
+      st.pendingExpTotal += exp;
+    }
+    return execs;
+  }
+
+  // ---- batch mode: create batches just in time, then launch due workers ----
+  const plan = lane.plan;
+  if (!plan) return 0;
+  const m = lane.m;
+  const tm = times(ns, ctx, t);
+  const s = st.spacing;
+  const P = Math.max(plan.P, 4 * s);
+
+  for (;;) {
+    // Earliest landing whose first weaken (landing at L + s) can still launch now.
+    const L = Math.max(lane.nextLand, now + tm.weaken + b - s, lane.lastLandEnd + s);
+    // Create the batch only when its first weaken is due to launch.
+    if (L + s - tm.weaken - b > look) break;
+    if (st.pids.size + queuedCount(st) + 4 > cfg.maxWorkerScripts) break;
+
+    const pctNow = samplePct(ns, lane, now);
+    const pct = predictPct(ns, st, lane, ctx, L, pctNow);
+    const shape = shapeAt(m, plan.h, pct);
+    const batch = {
+      id: ++st.batchSeq,
+      cancelled: false,
+      launched: new Set(),
+      expectedPerThread: pctNow * m.moneyMax, // money one hack thread should take at least
+      land: L,
+    };
+    lane.batches.set(batch.id, batch);
+    lane.queues.hack.push({ kind: "hack", amount: shape.h, land: L, batch, tag: "H" });
+    lane.queues.weaken.push({ kind: "weaken", amount: shape.w1, land: L + s, batch, tag: "W1" });
+    lane.queues.grow.push({ kind: "grow", amount: shape.g, land: L + 2 * s, batch, tag: "G" });
+    lane.queues.weaken.push({ kind: "weaken", amount: shape.w2, land: L + 3 * s, batch, tag: "W2" });
+    if (st.useFormulas) {
+      const e = ns.formulas.hacking.hackExp(m.server, ctx.player);
+      const exp = e * (shape.h * (m.chance + (1 - m.chance) / 4) + shape.g + shape.w1 + shape.w2);
+      st.pendingExp.push({ land: L, exp });
+      st.pendingExpTotal += exp;
+    }
+    if (!lane.firstLand) lane.firstLand = L;
+    lane.nextLand = L + P;
+    lane.lastLandEnd = L + 3 * s;
+    st.session.batches++;
+  }
+
+  // Launch every queued worker whose start time has come: weakens start
+  // earliest, then grow, then hack.
+  for (const kind of ["weaken", "grow", "hack"]) {
+    const q = lane.queues[kind];
+    while (q.length > 0 && q[0].land - tm[kind] - b <= look) {
+      const op = q.shift();
+      execs += launch(ns, cfg, st, ledger, lane, { ...op, wait: true });
+    }
+  }
+  return execs;
+}
+
+function queuedCount(st) {
+  let n = 0;
+  for (const lane of st.lanes.values()) n += lane.queues.weaken.length + lane.queues.grow.length + lane.queues.hack.length;
+  return n;
+}
+
+/** One batch's threads, with grow sized for the hack % expected at landing. */
+function shapeAt(m, h, pct) {
+  const f = Math.min(1 - 1 / m.moneyMax, h * pct);
+  const g = m.growThreads(f);
+  return { h, g, w1: Math.ceil((h * m.hackSec) / m.weakenPer), w2: Math.ceil((g * m.growSec) / m.weakenPer) };
+}
+
+/** Live hack % per thread, sampled only while the target is at min security. */
+function samplePct(ns, lane, now) {
+  const t = lane.target;
+  if (ns.getServerSecurityLevel(t) <= lane.m.minSec + 1e-9) {
+    const pct = ns.hackAnalyze(t);
+    const last = lane.pctSamples[lane.pctSamples.length - 1];
+    if (!last || now - last.t > 500) lane.pctSamples.push({ t: now, pct });
+    const keepFrom = now - 2 * lane.m.weakenTime;
+    while (lane.pctSamples.length > 2 && lane.pctSamples[0].t < keepFrom) lane.pctSamples.shift();
+    return pct;
+  }
+  const last = lane.pctSamples[lane.pctSamples.length - 1];
+  return last ? last.pct : lane.m.hackPct;
+}
+
+/**
+ * Hack % a batch landing at time L will actually see. Levels rise while
+ * batches are in flight, so a hack takes a little more than when it was
+ * planned; the grow is sized for that.
+ *  - With Formulas.exe: add up the exp every in-flight worker will give before
+ *    L, turn that into a level, and ask the formula for that level's hack %.
+ *  - Without: extrapolate from how fast hack % has been rising.
+ */
+function predictPct(ns, st, lane, ctx, L, pctNow) {
+  const m = lane.m;
+  if (st.useFormulas && ctx.player && m.server) {
+    const p = ctx.player;
+    // All exp still in flight. Some of it lands after L (other targets with
+    // longer weakens), which slightly overstates the level: that only makes
+    // the grow a little bigger, which is the safe direction.
+    const pending = st.pendingExpTotal;
+    const sk = ns.formulas.skills;
+    const gain = sk.calculateSkill(p.exp.hacking + pending, p.mults.hacking) - sk.calculateSkill(p.exp.hacking, p.mults.hacking);
+    // One level of headroom: a level-up the prediction just misses then costs
+    // a few spare grow threads instead of a re-prep.
+    const future = { ...p, skills: { ...p.skills, hacking: p.skills.hacking + Math.max(0, gain) + 1 } };
+    return Math.max(pctNow, ns.formulas.hacking.hackPercent(m.server, future));
+  }
+  const smp = lane.pctSamples;
+  if (smp.length < 2) return pctNow;
+  const a = smp[0];
+  const z = smp[smp.length - 1];
+  const slope = Math.max(0, (z.pct - a.pct) / Math.max(1, z.t - a.t));
+  return pctNow + slope * Math.max(0, L - Date.now());
+}
+
+/** Launch one operation across as many servers as it needs. Returns exec count. */
+function launch(ns, cfg, st, ledger, lane, op) {
+  const { batch, kind } = op;
+  if (batch.cancelled || op.amount <= 0) return 0;
+  // Never start a hack unless its weakens and grow are already running, and
+  // never a grow without the weaken that cleans up after it.
+  if (op.wait && op.tag === "H" && !(batch.launched.has("W1") && batch.launched.has("W2") && batch.launched.has("G"))) {
+    batch.cancelled = true;
+    return 0;
+  }
+  if (op.wait && op.tag === "G" && !batch.launched.has("W2")) {
+    batch.cancelled = true;
+    return 0;
+  }
+  const pieces = op.pieces ?? ledger.plan(kind, op.amount);
+  if (!pieces) {
+    // Not enough RAM right now. Everything already launched for this batch
+    // is harmless on its own, so just drop the rest of it.
+    batch.cancelled = true;
+    return 0;
+  }
+  const minSec = op.wait ? lane.m.minSec : -1;
+  // Security is only raised between a hack/grow landing and its weaken,
+  // one gap later; allow two gaps for lateness. The launch buffer covers it.
+  const maxWait = 2 * st.spacing;
+  let ok = true;
+  let n = 0;
+  for (const p of pieces) {
+    const pid = ns.exec(cfg.workers[kind], p.host, { threads: p.threads, temporary: true }, lane.target, op.land, batch.id, cfg.ports.reports, minSec, maxWait);
+    n++;
+    if (pid > 0) {
+      st.pids.set(pid, { target: lane.target, kind, threads: p.threads, batch, prep: !op.wait, launchedAt: Date.now() });
+      lane.pids.add(pid);
+    } else ok = false;
+  }
+  ledger.take(kind, pieces);
+  if (op.tag === "H" && op.wait) {
+    batch.hackPieces = pieces.map((p) => p.threads);
+    batch.hackGot = 0;
+    batch.hackReported = 0;
+    batch.hackMissed = !ok;
+  }
+  if (ok) batch.launched.add(op.tag);
+  else batch.cancelled = true; // partial op: build nothing on top of it
+  return n;
+}
+
+// ---------------------------------------------------------------- reports ---
+
+function handleReports(ns, cfg, st, port) {
+  for (const r of drainPort(ns, port)) {
+    const info = st.pids.get(r.pid);
+    st.pids.delete(r.pid);
+    const lane = st.lanes.get(r.target);
+    if (lane) lane.pids.delete(r.pid);
+    // Lateness only teaches us about timing if it was a batch worker (prep
+    // isn't timing-critical) and the game didn't stall while it ran.
+    // (The game also needs a moment after a stall to catch up on its backlog.)
+    const fairTiming = info && !info.prep && info.launchedAt > st.lastStallAt + 3000;
+    if (fairTiming && !r.aborted && r.late > 0) st.lates.push(r.late);
+    if (st.lates.length > 2000) st.lates.splice(0, st.lates.length - 2000);
+    if (r.type !== "H") continue;
+    if (r.aborted) {
+      st.session.aborted++;
+      continue;
+    }
+    if (r.amount > 0) {
+      st.session.money += r.amount;
+      if (lane) {
+        lane.money += r.amount;
+        lane.income.push({ t: Date.now(), amount: r.amount });
+      }
+    }
+    // Health check: once every hack piece of a batch has reported, together
+    // they should have taken at least what was planned. Less means money
+    // wasn't at max or security wasn't at min when they landed.
+    if (lane && lane.mode === "batch" && info && info.batch.hackPieces) {
+      const b = info.batch;
+      b.hackGot += r.amount;
+      b.hackReported++;
+      if (r.amount <= 0) b.hackMissed = true; // a failed hack (chance) proves nothing
+      if (b.hackReported === b.hackPieces.length && !b.hackMissed) {
+        const pct = b.expectedPerThread / lane.m.moneyMax;
+        // Pieces land one after another, each on what the previous left.
+        const left = b.hackPieces.reduce((acc, t) => acc * Math.max(0, 1 - t * pct), 1);
+        const expected = lane.m.moneyMax * (1 - left);
+        if (b.hackGot < expected * 0.999) {
+          lane.mode = "drain";
+          lane.firstLand = 0;
+          lane.desyncs++;
+          st.session.desyncs++;
+          cancelQueued(lane);
+          // Widen the gap only if real timing lateness could have caused it
+          // (not a stall: re-prepping is the right fix for those).
+          const worst = st.lates.length ? Math.max(...st.lates) : 0;
+          if (fairTiming && 2 * worst > st.spacing) st.spacing = Math.min(cfg.spacingMaxMs, st.spacing * 2);
+        }
+      }
+    }
+  }
+  // Exp from workers that have landed is already in the player's exp.
+  const now = Date.now();
+  if (st.pendingExp.length) {
+    const kept = [];
+    let total = 0;
+    for (const e of st.pendingExp) {
+      if (e.land > now) {
+        kept.push(e);
+        total += e.exp;
+      }
+    }
+    st.pendingExp = kept;
+    st.pendingExpTotal = total;
+  }
+  if (now - (st.lastBatchPrune ?? 0) > 1000) {
+    st.lastBatchPrune = now;
+    for (const lane of st.lanes.values()) {
+      for (const [id, b] of lane.batches) if (b.land < now - 60000) lane.batches.delete(id);
+    }
+  }
+}
+
+/** Catch workers that ended without reporting (killed, crashed, full port). */
+function sweep(ns, st) {
+  for (const [pid, info] of st.pids) {
+    if (!ns.isRunning(pid)) {
+      st.pids.delete(pid);
+      st.lanes.get(info.target)?.pids.delete(pid);
+    }
+  }
+}
+
+// ----------------------------------------------------------------- status ---
+
+/** Income per second over the last minute (or since the first landing, if sooner). */
+function recentRate(lane) {
+  const now = Date.now();
+  lane.income = lane.income.filter((e) => now - e.t <= 60000);
+  if (!lane.firstLand || now <= lane.firstLand) return 0;
+  const span = Math.min(60000, now - lane.firstLand);
+  return (lane.income.reduce((a, e) => a + e.amount, 0) / span) * 1000;
+}
+
+function publish(ns, cfg, st, ledger, b) {
+  const lanes = [...st.lanes.values()].map((l) => ({
+    target: l.target,
+    mode: l.mode,
+    budget: l.budget ?? 0,
+    plan:
+      l.plan && l.mode === "batch"
+        ? { h: l.plan.h, w1: l.plan.w1, g: l.plan.g, w2: l.plan.w2, f: l.plan.f, P: l.plan.P, conc: l.plan.conc, rate: l.plan.rate, inFlight: l.plan.inFlight }
+        : null,
+    prep: l.mode === "prep" ? l.prep : null,
+    workers: l.pids.size,
+    money: l.money,
+    since: l.started,
+    firstLand: l.firstLand,
+    recentRate: recentRate(l),
+    desyncs: l.desyncs,
+    sec: ns.getServerSecurityLevel(l.target),
+    minSec: ns.getServerMinSecurityLevel(l.target),
+    cash: ns.getServerMoneyAvailable(l.target),
+    maxCash: ns.getServerMaxMoney(l.target),
+  }));
+  ns.clearPort(cfg.ports.batcher);
+  ns.writePort(cfg.ports.batcher, {
+    updated: Date.now(),
+    formulas: st.useFormulas,
+    spacing: st.spacing,
+    stalls: st.stalls,
+    lateStats: st.lateStats ?? null,
+    planStats: st.planStats ?? null,
+    planning: !!st.planner,
+    usage: st.usage ?? null,
+    buffer: b,
+    capacity: st.capacity,
+    totalRam: ledger.totalRam(),
+    hosts: ledger.hosts.length,
+    workers: st.pids.size,
+    maxWorkers: cfg.maxWorkerScripts,
+    nextReplan: st.nextReplan,
+    session: st.session,
+    lanes,
+  });
+}
