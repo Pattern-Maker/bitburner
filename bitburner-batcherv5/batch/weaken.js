@@ -1,22 +1,27 @@
 /**
- * Weaken worker. Args: target, plannedEnd (ms epoch), id, reportPort, minSec, maxWait.
+ * Weaken worker. Args: target, plannedEnd (ms epoch), id, reportPort.
  *
- * An operation's duration is fixed the moment it starts, from the target's
- * security at that moment. So if another batch has just raised security, this
- * waits until it's back at minimum before starting, for at most maxWait ms
- * (one landing gap or so). minSec < 0 means "don't wait" (used for prep,
- * where security is high on purpose).
- * The delay is then worked out here, so slow launches and level-ups don't
- * move the landing time.
+ * The game applies an operation's effect the moment its timer fires, and
+ * timers fire in due-time order even when the game is running late. So the
+ * landing is exact as long as the worker can still schedule it: it adds
+ * whatever delay makes the operation end at plannedEnd. That spare time is
+ * the "slack" it reports; negative slack means it started too late.
  * @param {NS} ns
  */
 export async function main(ns) {
-  const [target, plannedEnd, id, port, minSec, maxWait] = ns.args;
+  const [target, plannedEnd, id, port, minSec = -1, maxWait = 0] = ns.args;
+  // An operation's duration is fixed when it starts, from the security at
+  // that moment. Just after another batch's hack or grow lands, security is
+  // briefly raised (until its weaken lands, one gap later), and starting then
+  // would make this take far longer than planned. So wait for minimum
+  // security first, for at most maxWait ms.
   if (minSec >= 0) {
     const until = Date.now() + maxWait;
     while (ns.getServerSecurityLevel(target) > minSec + 1e-9 && Date.now() < until) await ns.sleep(1);
   }
-  const delay = Math.max(0, plannedEnd - Date.now() - ns.getWeakenTime(target));
-  await ns.weaken(target, { additionalMsec: delay });
-  ns.writePort(port, { type: "W", pid: ns.pid, id, target, late: Date.now() - plannedEnd, aborted: false, amount: 0 });
+  const slack = plannedEnd - Date.now() - ns.getWeakenTime(target);
+  // Starting too late shifts the landing later by -slack ms; the batcher
+  // launches earlier when that happens.
+  await ns.weaken(target, { additionalMsec: Math.max(0, slack) });
+  ns.writePort(port, { type: "W", pid: ns.pid, id, target, slack, late: Date.now() - plannedEnd, aborted: false, amount: 0 });
 }

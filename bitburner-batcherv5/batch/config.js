@@ -12,14 +12,12 @@ export const CONFIG = {
   homeReserveGB: 32,
   homeReserveMaxFraction: 0.25,
 
-  // Gap between landings inside a batch (ms). This is only the starting value:
-  // the batcher measures how late workers actually finish and adjusts it.
-  spacingStartMs: 20,
-  // Never tighten below this, however good the measurements look.
+  // Gap between landings inside a batch (ms). The game resolves landings in
+  // due-time order even when it runs late, so this only has to cover timer
+  // precision (about a millisecond each way), not the game's lag. Each target
+  // lands one batch per 4 gaps, so a smaller gap means more income per
+  // target. Workers that start too late are handled by launching earlier.
   spacingMinMs: 4,
-  // Never widen beyond this. A healthy gap is a few ms to tens of ms; anything
-  // bigger means the game itself was stalling, which a wider gap can't fix.
-  spacingMaxMs: 200,
 
   // How many pipeline cycles ahead to look when weighing a target's income
   // against the time it needs to prep. Also the margin before a running

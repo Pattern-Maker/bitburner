@@ -84,8 +84,17 @@ didn't work, makes that lane stop, let its batches land, re-prep and resume.
 Each lane also learns how far its hacks run over the plan (level-ups the
 prediction missed) and sizes its grows for that. Every drift is recorded with
 its cause for `report.js`. Workers that would start while security is briefly raised wait (at
-most two landing gaps) so their timing stays exact. The landing gap is kept at
-twice the worst lateness measured.
+most two landing gaps) so their timing stays exact.
+
+**Timing.** The game applies an operation's effect the moment its timer
+fires, and timers fire in due-time order even when the game is running late.
+So game lag delays landings but never reorders them, and the gap between
+landings only has to cover timer precision: it's fixed at `spacingMinMs`
+(4 ms). The one thing that can break a batch is a worker starting too late
+to schedule its landing. Each worker reports its spare time ("slack"), and
+the launch buffer is set to twice the worst launch lag measured, so workers
+start early enough. Each target lands one batch every 4 gaps, so this alone
+was worth about 3.6x the income in simulation when targets are the limit.
 
 **Cores.** Grow and weaken go to servers with more cores first, where each
 thread does more, and thread counts are reduced to match.

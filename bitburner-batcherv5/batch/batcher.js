@@ -43,7 +43,14 @@ export async function main(ns) {
 
   const TICK = 10; // ms between loop passes; workers time themselves, so this only sets launch lookahead
   const st = {
-    spacing: cfg.spacingStartMs,
+    // Landing gap. Fixed at the safe minimum: the game resolves landings in
+    // due-time order however late it runs, so the only thing that can break
+    // a batch's order is a worker starting too late, and that's handled by
+    // launching earlier (the buffer), not by spreading landings out.
+    spacing: cfg.spacingMinMs,
+    lags: [], // ms between launching a worker and it scheduling its landing
+    lagP99: 0,
+    miss: { landed: 0, missed: 0 },
     msPerExec: 1,
     lanes: new Map(), // target -> lane
     pids: new Map(), // pid -> { target, kind, threads, batch }
@@ -72,7 +79,9 @@ export async function main(ns) {
     incomeLog: [], // { t, money } in 10 s buckets for the last 30 minutes
     repairs: 0,
   };
-  const buffer = () => 4 * st.spacing + Math.ceil(st.msPerExec * 8) + 2 * TICK;
+  // How early workers are launched: enough for the gaps, the launch loop
+  // itself, and twice the worst launch lag measured.
+  const buffer = () => 4 * st.spacing + Math.max(Math.ceil(st.msPerExec * 8) + 2 * TICK, Math.ceil(2 * st.lagP99));
 
   let lastRefresh = 0;
   let lastSweep = 0;
@@ -157,22 +166,26 @@ function startReplan(ns, cfg, st, ledger, b) {
   st.ramKey = ledger.hosts.map((h) => `${h.host}:${h.maxRam}`).join(",");
   st.capacity = ledger.capacityThreads();
 
-  // Landing gap: twice the worst lateness seen since the last replan (ignoring
-  // the slowest 1% once there are plenty of samples, so a one-off hiccup
-  // doesn't widen it for everyone). With too few samples to judge, it eases
-  // back down, so it can never get stuck wide because a wide gap means few
-  // batches and so few samples. Never above spacingMaxMs.
-  if (st.lates.length >= 20) {
-    const sorted = [...st.lates].sort((a, c) => a - c);
+  const pct = (arr) => {
+    const sorted = [...arr].sort((a, c) => a - c);
     const at = (q) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))];
-    const worst = sorted.length >= 100 ? at(0.99) : sorted[sorted.length - 1];
-    st.lateStats = { p50: at(0.5), p99: at(0.99), max: sorted[sorted.length - 1], n: sorted.length, at: now };
-    st.spacing = Math.ceil(Math.max(2 * worst, 0.8 * st.spacing));
+    return { p50: at(0.5), p99: at(0.99), max: sorted[sorted.length - 1], n: sorted.length, at: now };
+  };
+  // Game lag: how late landings resolve. Shown for interest only, since it
+  // can't reorder a batch.
+  if (st.lates.length >= 20) {
+    st.lateStats = pct(st.lates);
     st.lates = [];
-  } else {
-    st.spacing = Math.floor(0.8 * st.spacing);
   }
-  st.spacing = Math.min(cfg.spacingMaxMs, Math.max(cfg.spacingMinMs, st.spacing));
+  // Launch lag sets the buffer: twice the worst 1% (or worst, with few samples).
+  if (st.lags.length >= 20) {
+    st.lagStats = pct(st.lags);
+    st.lagP99 = Math.max(0, st.lags.length >= 100 ? st.lagStats.p99 : st.lagStats.max);
+    st.lags = [];
+  }
+  st.missStats = { ...st.miss, at: now };
+  st.miss = { landed: 0, missed: 0 };
+  st.spacing = cfg.spacingMinMs;
 
   const level = ns.getHackingLevel();
   const valid = st.hosts.filter(
@@ -396,17 +409,19 @@ function tuneSlots(ns, cfg, st) {
   const T = st.slots;
   let expected = 0;
   for (const lane of st.lanes.values()) if (lane.mode === "batch" && lane.plan) expected += lane.plan.rate;
-  const L = st.lateStats;
   const log = (what) => {
     T.history.push({ at: Date.now(), cap: T.cap, what, expected: Math.round(expected * 1000) });
     if (T.history.length > 20) T.history.shift();
   };
-  // The game is struggling: back off whatever phase we're in.
-  if (L && L.p99 > cfg.spacingMaxMs / 2 && T.cap > cfg.maxWorkerScripts) {
+  // The game is struggling (workers starting too late to land in their slot,
+  // or launch lag past a second): back off whatever phase we're in.
+  const M = st.missStats;
+  const struggling = (M && M.landed >= 100 && M.missed / M.landed > 0.01) || st.lagP99 > 1000;
+  if (struggling && T.cap > cfg.maxWorkerScripts) {
     T.cap = Math.max(cfg.maxWorkerScripts, Math.floor(T.cap * 0.8));
     T.phase = "idle";
     T.cooldown = 5;
-    log("lateness too high, lowered");
+    log("workers starting late, lowered");
     return;
   }
   if (T.phase === "probe1") {
@@ -720,7 +735,7 @@ function stepLane(ns, cfg, st, ledger, lane, now, b, TICK, ctx) {
     const q = lane.queues[kind];
     while (q.length > 0 && q[0].land - tm[kind] - b <= look) {
       const op = q.shift();
-      execs += launch(ns, cfg, st, ledger, lane, { ...op, wait: true });
+      execs += launch(ns, cfg, st, ledger, lane, { ...op, wait: true, dur: tm[kind] });
     }
   }
   return execs;
@@ -832,9 +847,12 @@ function launch(ns, cfg, st, ledger, lane, op) {
     batch.cancelled = true;
     return 0;
   }
+  // The slack this worker should have when it starts; what it actually has
+  // tells us the launch lag.
+  const plannedSlack = op.dur != null ? op.land - Date.now() - op.dur : null;
+  // Workers wait (up to two gaps) for security to be back at minimum before
+  // starting; prep workers don't, since security is high on purpose then.
   const minSec = op.wait ? lane.m.minSec : -1;
-  // Security is only raised between a hack/grow landing and its weaken,
-  // one gap later; allow two gaps for lateness. The launch buffer covers it.
   const maxWait = 2 * st.spacing;
   let ok = true;
   let n = 0;
@@ -842,7 +860,7 @@ function launch(ns, cfg, st, ledger, lane, op) {
     const pid = ns.exec(cfg.workers[kind], p.host, { threads: p.threads, temporary: true }, lane.target, op.land, batch.id, cfg.ports.reports, minSec, maxWait);
     n++;
     if (pid > 0) {
-      st.pids.set(pid, { target: lane.target, kind, threads: p.threads, batch, prep: !op.wait, launchedAt: Date.now() });
+      st.pids.set(pid, { target: lane.target, kind, threads: p.threads, batch, prep: !op.wait, launchedAt: Date.now(), plannedSlack });
       lane.pids.add(pid);
     } else ok = false;
   }
@@ -872,6 +890,12 @@ function handleReports(ns, cfg, st, port) {
     const fairTiming = info && !info.prep && info.launchedAt > st.lastStallAt + 3000;
     if (fairTiming && !r.aborted && r.late > 0) st.lates.push(r.late);
     if (st.lates.length > 2000) st.lates.splice(0, st.lates.length - 2000);
+    if (fairTiming && typeof r.slack === "number" && info.plannedSlack != null) {
+      st.lags.push(info.plannedSlack - r.slack);
+      if (st.lags.length > 2000) st.lags.splice(0, st.lags.length - 2000);
+      st.miss.landed++;
+      if (r.slack < 0) st.miss.missed++;
+    }
     if (r.type !== "H") continue;
     if (r.aborted) {
       st.session.aborted++;
@@ -944,10 +968,6 @@ function handleReports(ns, cfg, st, port) {
             lane.desyncs++;
             st.session.desyncs++;
             cancelQueued(lane);
-            // Widen the gap only if real timing lateness could have caused it
-            // (not a stall: re-prepping is the right fix for those).
-            const worst = st.lates.length ? Math.max(...st.lates) : 0;
-            if (fairTiming && 2 * worst > st.spacing) st.spacing = Math.min(cfg.spacingMaxMs, st.spacing * 2);
           }
           st.drifts.push(drift);
           if (st.drifts.length > 50) st.drifts.shift();
@@ -1026,6 +1046,8 @@ function publish(ns, cfg, st, ledger, b) {
     spacing: st.spacing,
     stalls: st.stalls,
     lateStats: st.lateStats ?? null,
+    lagStats: st.lagStats ?? null,
+    missStats: st.missStats ?? null,
     planStats: st.planStats ?? null,
     planning: !!st.planner,
     lastError: st.lastError ?? null,

@@ -59,9 +59,15 @@ function render(ns, f, money) {
       else if (sh.reserve > 0.11) ns.print(`  Sharing     holding back ${f.percent(sh.reserve, 0)} of threads after batches needed RAM`);
     }
     ns.print(`  Timing      ${b.spacing} ms gap, ${b.buffer} ms launch buffer, replan in ${f.time(Math.max(0, b.nextReplan - now))}`);
+    if (b.lagStats) {
+      const L = b.lagStats;
+      const M = b.missStats;
+      const missed = M && M.landed ? `, ${f.number(M.missed, 0)} of ${f.number(M.landed, 0)} missed their slot` : "";
+      ns.print(`  Launch lag  typical ${Math.round(L.p50)} ms, worst 1% ${Math.round(L.p99)} ms${missed}`);
+    }
     if (b.lateStats) {
       const L = b.lateStats;
-      ns.print(`  Lateness    typical ${Math.round(L.p50)} ms, worst 1% ${Math.round(L.p99)} ms, max ${Math.round(L.max)} ms (${L.n} landings)`);
+      ns.print(`  Game lag    landings resolve ~${Math.round(L.p50)} ms late (worst 1% ${Math.round(L.p99)} ms); harmless, order is kept`);
     }
     if (b.planStats) {
       const p = b.planStats;

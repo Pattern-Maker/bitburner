@@ -42,7 +42,8 @@ export async function main(ns) {
     out(`  RAM ${ns.format.ram(b.totalRam)} on ${b.hosts} servers = ${num(b.capacity)} threads; workers ${b.workers}/${b.maxWorkers}`);
     if (b.usage) out(`  plan uses ${((b.usage.used / Math.max(1, b.usage.capacity)) * 100).toFixed(1)}% of threads, slots ${b.usage.slotsUsed}/${b.usage.slots}, limit: ${b.usage.limit ?? "?"} (${b.usage.targets ?? "?"} of ${b.usage.considered ?? "?"} targets used, ${b.usage.saturated ?? "?"} saturated)`);
     out(`  gap ${b.spacing} ms, buffer ${b.buffer} ms`);
-    if (b.lateStats) out(`  lateness p50 ${b.lateStats.p50} ms, p99 ${b.lateStats.p99} ms, max ${b.lateStats.max} ms (n=${b.lateStats.n})`);
+    if (b.lagStats) out(`  launch lag p50 ${Math.round(b.lagStats.p50)} ms, p99 ${Math.round(b.lagStats.p99)} ms, max ${Math.round(b.lagStats.max)} ms (n=${b.lagStats.n}); missed slots ${b.missStats?.missed ?? "?"}/${b.missStats?.landed ?? "?"}`);
+    if (b.lateStats) out(`  game lag p50 ${b.lateStats.p50} ms, p99 ${b.lateStats.p99} ms, max ${b.lateStats.max} ms (n=${b.lateStats.n})`);
     if (b.planStats) out(`  planner ${b.planStats.targets} targets, ${b.planStats.ms} ms over ${b.planStats.ticks} ticks`);
     if (b.stalls?.count) out(`  stalls ${b.stalls.count}, last ${Math.round(b.stalls.lastMs / 1000)}s long, ${Math.round((now - b.stalls.lastAt) / 1000)}s ago`);
     if (b.share) out(`  sharing ${num(b.share.threads)} threads, rep x${b.share.power.toFixed(3)}, reserve ${(b.share.reserve * 100).toFixed(0)}%, reclaims ${b.share.reclaims}`);
