@@ -117,6 +117,22 @@ function render(ns, f, money) {
     }
   }
 
+  const tr = ns.peek(CONFIG.ports.train);
+  if (tr !== "NULL PORT DATA" && tr.state !== "stopped") {
+    ns.print("");
+    ns.print(`== Training ==`);
+    if (tr.state === "training") {
+      const eta = tr.etaOverYear ? ", over a year at this rate (augments help far more)" : tr.etaSec ? `, about ${f.time(tr.etaSec * 1000)} to go` : "";
+      ns.print(`  Now         ${tr.stat} at ${tr.place}`);
+      ns.print(`  Stat total  ${f.number(tr.total, 0)} / ${f.number(tr.goal, 0)} for ${tr.goalName} at "${tr.level}"${eta}`);
+    } else ns.print(`  ${tr.state}: ${tr.note ?? ""}`);
+    if (tr.summary) {
+      const ready = tr.summary.filter((x) => x.ready).length;
+      const next = tr.summary.find((x) => !x.ready);
+      ns.print(`  Locations   ${ready} / ${tr.summary.length} at "${tr.level}" or easier`);
+    }
+  }
+
   if (c !== "NULL PORT DATA") {
     ns.print("");
     ns.print(`== To do ==`);

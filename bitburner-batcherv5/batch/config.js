@@ -64,6 +64,17 @@ export const CONFIG = {
     intervalMs: 30000,
   },
 
+  // Stat training for infiltration (train.js, needs Source-File 4). You start
+  // it yourself, since it takes over what your character is doing.
+  // level: the infiltration difficulty to reach (trivial, normal or hard).
+  // focus: focusing trains faster but takes over the screen.
+  // roundSec: how long each stat is trained before picking again.
+  train: {
+    level: "normal",
+    focus: false,
+    roundSec: 60,
+  },
+
   // Port numbers used for communication. Change only if they clash with yours.
   ports: {
     reports: 7101, // workers -> batcher (finish times, money taken)
@@ -71,6 +82,7 @@ export const CONFIG = {
     crawler: 7103, // crawler -> status / start
     buyer: 7104, // buyer -> status
     singularity: 7105, // singularity -> status
+    train: 7106, // train -> status
   },
 
   workers: {

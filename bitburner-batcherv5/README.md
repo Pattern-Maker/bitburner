@@ -12,6 +12,7 @@ run start.js
 |---|---|---|
 | `start.js` | Starts everything, restarts anything that stops | ~4 GB |
 | `cleanup.js` | Removes leftover scripts from every server | ~3 GB |
+| `update.js` | Downloads the latest scripts from the GitHub repo | ~6 GB |
 | `batch/config.js` | Your preferences (home reserve, script cap, ports) | – |
 | `batch/lib.js` | Scanning, rooting, RAM ledger, model and solvers | – |
 | `batch/crawler.js` | Roots servers every 30 s and copies workers out | ~5 GB |
@@ -19,9 +20,24 @@ run start.js
 | `batch/status.js` | Live tail window | ~1.6 GB |
 | `batch/buyer.js` | Buys and upgrades cloud servers while RAM is the bottleneck | ~6 GB |
 | `batch/singularity.js` | Backdoors and home RAM upgrades (needs Source-File 4) | varies |
+| `batch/train.js` | Trains stats for infiltration; you start it yourself (needs Source-File 4) | varies |
 | `batch/hack.js`, `grow.js`, `weaken.js` | Workers | 1.85–1.9 GB per thread |
 
 All of it needs roughly 25 GB on home.
+
+## Updating
+
+```
+run update.js            update if the repo changed, then restart the suite
+run update.js --check    just say whether there's an update
+run update.js --force    download everything again
+```
+
+It finds the folder in the repo that holds `start.js` and installs that
+folder's contents to home. Everything is downloaded before anything is
+replaced, so a failed download changes nothing. Files deleted from the repo
+are removed in-game too. Settings live in `batch/config.js`, which updates
+like any other file, so change settings in the repo rather than in-game.
 
 ## How it works
 
@@ -75,6 +91,21 @@ is (usually script slots, fixed by raising `maxWorkerScripts`).
 you can (faction servers first, never w0r1d_d43m0n unless you opt in) and
 upgrades home RAM when it's no dearer per GB than cloud servers. Your terminal
 follows it between servers while it works.
+
+`train.js` trains your stats for infiltration. Difficulty depends on the sum
+str + def + dex + agi + cha, so each round it trains whichever stat gains the
+most levels, at the best gym or university for it. It shows the exact stat
+total each location needs and a real ETA (levels slow down as they rise, so
+it simulates the rest of the training rather than extrapolating). It isn't
+started by start.js, because it takes over what your character is doing; it
+stops itself when done, or if you start other work.
+
+```
+run batch/train.js                    work through locations, easiest first
+run batch/train.js --location ECorp   one location
+run batch/train.js --level hard       trivial | normal (default) | hard
+run batch/train.js --focus            faster, but takes over the screen
+```
 
 ## What's left to you
 
