@@ -75,6 +75,9 @@ export class Ledger {
     this.hosts = [];
     this.byName = new Map();
     this.coreCache = new Map();
+    this.homeShareGB = 0; // home RAM set aside for sharing (see refresh)
+    this.homeShareHeld = 0; // GB of it actually sharing; the batcher keeps this current
+    this.otherRam = 0;
   }
 
   /** How much more a grow or weaken thread does on a server with these cores. */
@@ -91,27 +94,37 @@ export class Ledger {
     const { ns, cfg } = this;
     this.hosts = [];
     this.byName.clear();
-    // Once home is a small share of all your RAM, it's worth more as a
-    // dedicated share server (its extra cores make each share thread count
-    // for more) than as a sliver of batching RAM. The batcher runs the share.
-    const frac = cfg.share?.enabled ? cfg.share.dedicateHomeBelow ?? 0 : 0;
-    this.homeDedicated = false;
-    if (frac > 0) {
-      let total = 0;
-      for (const host of hostNames) {
-        if (host.startsWith("hacknet-")) continue;
-        const s = ns.getServer(host);
-        if (s.hasAdminRights && !(s.purchasedByPlayer && host !== "home" && !cfg.usePurchasedServers)) total += s.maxRam;
-      }
-      this.homeDedicated = ns.getServerMaxRam("home") <= frac * total;
+    // Home shares part of itself (its cores make each share thread count for
+    // more): homeShareStart of it to begin with, and once home is at most
+    // homeExchangeBelow of all your RAM, every GB of RAM you gain elsewhere
+    // frees one more GB of home for sharing, until all of it shares.
+    const sh = cfg.share ?? {};
+    let other = 0;
+    for (const host of hostNames) {
+      if (host === "home" || host.startsWith("hacknet-")) continue;
+      const s = ns.getServer(host);
+      if (s.hasAdminRights && !(s.purchasedByPlayer && !cfg.usePurchasedServers)) other += s.maxRam;
+    }
+    this.otherRam = other;
+    const homeMax = ns.getServerMaxRam("home");
+    const homeScripts = Math.min(cfg.homeReserveGB, homeMax * cfg.homeReserveMaxFraction);
+    this.homeShareGB = 0;
+    if (sh.enabled && (sh.homeShareStart ?? 0) + (sh.homeExchangeBelow ?? 0) > 0) {
+      const x = sh.homeExchangeBelow ?? 0;
+      // Other RAM at which home becomes exactly x of the total.
+      const pivot = x > 0 ? (homeMax * (1 - x)) / x : Infinity;
+      const gb = homeMax * (sh.homeShareStart ?? 0) + Math.max(0, other - pivot);
+      this.homeShareGB = Math.max(0, Math.min(homeMax - homeScripts, gb));
     }
     for (const host of hostNames) {
-      if (host === "home" && this.homeDedicated) continue;
       if (host.startsWith("hacknet-")) continue; // their RAM makes hashes
       const s = ns.getServer(host);
       if (!s.hasAdminRights || s.maxRam <= 0) continue;
       if (s.purchasedByPlayer && host !== "home" && !cfg.usePurchasedServers) continue;
-      const reserve = host === "home" ? Math.min(cfg.homeReserveGB, s.maxRam * cfg.homeReserveMaxFraction) : 0;
+      let reserve = host === "home" ? homeScripts : 0;
+      // Home RAM set aside for sharing that isn't shared yet stays out of
+      // batching too (the batcher fills it as batches there finish).
+      if (host === "home") reserve += Math.max(0, this.homeShareGB - this.homeShareHeld);
       const h = {
         host,
         maxRam: s.maxRam,
@@ -137,6 +150,8 @@ export class Ledger {
       for (const p of this.ns.ps(h.host)) {
         if (this.workerFiles.has(p.filename)) ours += p.threads * (this.scriptRam[kindOf(p.filename)] ?? this.threadRam);
       }
+      // Home's own share isn't coming back for batches.
+      if (h.host === "home") ours = Math.max(0, ours - this.homeShareHeld);
       total += Math.floor((h.free + ours) / this.threadRam);
     }
     return total;
@@ -292,10 +307,35 @@ export function prepNeeds(ns, m) {
 /** Threads one HWGW batch needs if it hacks with `h` threads. */
 export function batchShape(m, h, hackPct = m.hackPct) {
   const f = Math.min(1, h * hackPct); // fraction of money taken
+  if (m.hgw) {
+    // HGW: the grow lands right after the hack, while the hack's security is
+    // still on, and one weaken then undoes both.
+    const g = growAfterHack(m, f, h * m.hackSec);
+    const w2 = Math.ceil((h * m.hackSec + g * m.growSec) / m.weakenPer);
+    return { h, f, g, w1: 0, w2, total: h + g + w2 };
+  }
   const g = m.growThreads(f); // threads to grow it back to max
   const w1 = Math.ceil((h * m.hackSec) / m.weakenPer); // undo hack's security
   const w2 = Math.ceil((g * m.growSec) / m.weakenPer); // undo grow's security
   return { h, f, g, w1, w2, total: h + w1 + g + w2 };
+}
+
+/**
+ * Grow threads to restore fraction f when security is dSec above minimum.
+ * The game's growth per thread is min(ln(1 + 0.03 / security), ln(1.0035))
+ * times the server's growth, so threads scale by that ratio (and servers
+ * with minimum security under 8.57 don't care at all).
+ */
+export function growAfterHack(m, f, dSec) {
+  const g = m.growThreads(f);
+  if (!(dSec > 0) || g <= 0) return g;
+  const k = (sec) => Math.min(Math.log1p(0.03 / sec), 0.00349388925425578);
+  return Math.ceil((g * k(m.minSec)) / k(m.minSec + dSec));
+}
+
+/** Landings per batch: 4 for HWGW, 3 for HGW. */
+export function batchGaps(m) {
+  return m.hgw ? 3 : 4;
 }
 
 /**
@@ -366,8 +406,9 @@ export function solveStream(m, budget, spacing, buffer, maxInFlight) {
 
   // Longest useful period: one batch at a time. Shortest: limited by the
   // landing gap and by how many batches may be in flight.
-  const Pmax = Tw + 4 * spacing;
-  const Pmin = Math.min(Pmax, Math.max(4 * spacing, Tw / maxInFlight));
+  const gaps = batchGaps(m);
+  const Pmax = Tw + gaps * spacing;
+  const Pmin = Math.min(Pmax, Math.max(gaps * spacing, Tw / maxInFlight));
   const Ps = [];
   for (let P = Pmin; P < Pmax; P *= 1.08) Ps.push(P);
   Ps.push(Pmax);

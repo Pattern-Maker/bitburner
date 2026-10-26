@@ -1,4 +1,4 @@
-import { CONFIG } from "./config.js";
+import { CONFIG, loadConfig } from "./config.js";
 import { scanAll } from "./lib.js";
 import { SOLVERS } from "./solvers.js";
 
@@ -14,6 +14,7 @@ import { SOLVERS } from "./solvers.js";
  * @param {NS} ns
  */
 export async function main(ns) {
+  loadConfig(ns);
   ns.disableLog("ALL");
   const cc = ns.codingcontract;
   const state = { solved: 0, recent: [], failed: [], unknown: [], lastScan: 0 };

@@ -1,5 +1,5 @@
-import { CONFIG } from "./config.js";
-import { scanAll, Ledger, buildModel, prepNeeds, solveStream, prepShape, isPrepped, drainPort } from "./lib.js";
+import { CONFIG, loadConfig } from "./config.js";
+import { scanAll, Ledger, buildModel, prepNeeds, solveStream, prepShape, isPrepped, drainPort, growAfterHack, batchGaps } from "./lib.js";
 
 /**
  * Continuous, multi-target HWGW batcher.
@@ -21,6 +21,7 @@ import { scanAll, Ledger, buildModel, prepNeeds, solveStream, prepShape, isPrepp
  * @param {NS} ns
  */
 export async function main(ns) {
+  loadConfig(ns);
   ns.disableLog("ALL");
   const cfg = CONFIG;
   const W = cfg.workers;
@@ -82,7 +83,10 @@ export async function main(ns) {
     modeLog: [], // recent lane mode changes, for report.js
     incomeLog: [], // { t, money } in 10 s buckets for the last 30 minutes
     repairs: 0,
+    stockGrow: new Set(), // servers whose grows run with { stock: true }
   };
+  // Home's share, in GB, as the ledger needs it to keep that RAM out of batching.
+  Object.defineProperty(ledger, "homeShareHeld", { get: () => (st.share.homeThreads ?? 0) * scriptRam.share });
   // How early workers are launched: enough for the gaps, the launch loop
   // itself, and twice the worst launch lag measured.
   const buffer = () => 4 * st.spacing + Math.max(Math.ceil(st.msPerExec * 8) + 2 * TICK, Math.ceil(2 * st.lagP99));
@@ -166,6 +170,9 @@ function startReplan(ns, cfg, st, ledger, b) {
   // after the plan only the excess is taken back (see startSharing), so the
   // rep boost doesn't dip at every replan.
   st.hosts = scanAll(ns).hosts;
+  // Companies whose shares stocks.js holds: grows on their servers push the price up.
+  const sp = ns.peek(cfg.ports.stocks ?? 0);
+  st.stockGrow = new Set(sp !== "NULL PORT DATA" && sp?.growServers ? sp.growServers : []);
   ledger.refresh(st.hosts);
   st.ramKey = ledger.hosts.map((h) => `${h.host}:${h.maxRam}`).join(",");
   st.capacity = ledger.capacityThreads();
@@ -214,12 +221,13 @@ function startReplan(ns, cfg, st, ledger, b) {
   const held = new Map();
   for (const info of st.pids.values()) held.set(info.target, (held.get(info.target) ?? 0) + info.threads);
   let reserved = 0;
-  for (const [t, lane] of st.lanes) if (lane.mode === "drain" || lane.mode === "retire") reserved += held.get(t) ?? 0;
+  for (const [t, lane] of st.lanes) if (lane.mode === "drain" || lane.mode === "retire" || lane.pre) reserved += held.get(t) ?? 0;
   const capacity = Math.max(0, st.capacity - reserved);
 
   const N = cfg.switchPaybackCycles;
   const cands = short.map((t) => {
     const m = buildModel(ns, t, st.useFormulas);
+    m.hgw = cfg.batchType === "hgw";
     const lane = st.lanes.get(t);
     const ready = lane ? lane.mode === "batch" : isPrepped(ns, t);
     return {
@@ -242,7 +250,9 @@ function startReplan(ns, cfg, st, ledger, b) {
     capacity,
     K,
     chunk: capacity / K,
-    maxInFlight: Math.max(1, Math.floor(st.slots.cap / 5)),
+    // Scripts per batch: one per landing plus some for operations split
+    // across servers.
+    maxInFlight: Math.max(1, Math.floor(st.slots.cap / (cfg.batchType === "hgw" ? 4 : 5))),
     ci: 0,
     j: 0,
     started: now,
@@ -332,6 +342,7 @@ function finishPlan(ns, cfg, st, ledger) {
   for (const { c, B } of order) {
     if (B < 1) continue;
     let lane = st.lanes.get(c.t);
+    if (lane) lane.pre = false; // unlocked: the planner owns it now
     if (lane && (lane.mode === "drain" || lane.mode === "retire")) {
       // Wanted again: once its workers have landed it re-preps with this budget.
       setMode(st, lane, "drain", "wanted again after retiring");
@@ -367,7 +378,7 @@ function finishPlan(ns, cfg, st, ledger) {
     }
   }
   for (const [t, lane] of st.lanes) {
-    if (!keep.has(t) && lane.mode !== "retire") {
+    if (!keep.has(t) && lane.mode !== "retire" && !lane.pre) {
       setMode(st, lane, "retire", "no longer worth its RAM");
       cancelQueued(lane);
     }
@@ -483,11 +494,16 @@ function startSharing(ns, cfg, st, ledger) {
   }
   // Ease the reserve back towards the configured level after a quiet plan.
   st.share.reserve = Math.max(cfg.share.reserveFraction, st.share.reserve * 0.9);
-  const spareThreads = st.usage.capacity - needed - st.share.reserve * st.usage.capacity;
-  const wantRam = Math.max(0, spareThreads * ledger.threadRam);
-
+  let spareThreads = st.usage.capacity - needed - st.share.reserve * st.usage.capacity;
   // Split it between hacking XP and faction rep.
   const use = spareUse(ns, cfg, st);
+  // When it isn't levelling you up, spare RAM first preps the next server
+  // you can't hack yet (weaken and grow only need root), so it batches the
+  // moment your level reaches it. While XP is on, levelling gets you there
+  // sooner than prepping saves, so XP comes first.
+  if (cfg.share.prePrep !== false && use.xp === 0) spareThreads = startPrePrep(ns, st, spareThreads);
+  const wantRam = Math.max(0, spareThreads * ledger.threadRam);
+
   const xpTarget = use.xp > 0 && R.xp > 0 ? pickXpTarget(ns, st) : null;
   const want = { xp: xpTarget ? wantRam * use.xp : 0 };
   want.share = wantRam - want.xp;
@@ -495,16 +511,9 @@ function startSharing(ns, cfg, st, ledger) {
   st.share.why = use.why;
   st.share.xpTarget = xpTarget;
 
-  // Forget lent workers that have ended (killed by hand, say), and stop
-  // home's share if home is batching again.
+  // Forget lent workers that have ended (killed by hand, say).
+  for (const [pid, info] of [...st.share.pids]) if (!ns.isRunning(pid)) forgetLent(st, pid, info);
   ledger.refresh(st.hosts);
-  for (const [pid, info] of [...st.share.pids]) {
-    const gone = !ns.isRunning(pid);
-    if (gone || (info.home && !ledger.homeDedicated)) {
-      if (!gone) ns.kill(pid);
-      forgetLent(st, pid, info);
-    }
-  }
   // Top up or trim what's already lent, rather than restarting it.
   const haveRam = (kind) => {
     let r = 0;
@@ -516,7 +525,7 @@ function startSharing(ns, cfg, st, ledger) {
     if (have > want[kind] + R[kind]) stopSharing(ns, st, R, have - want[kind], kind, xpTarget);
   }
   ledger.refresh(st.hosts);
-  if (ledger.homeDedicated) shareHome(ns, cfg, st, R.share);
+  shareHome(ns, cfg, st, ledger, R.share);
   const hosts = [...ledger.hosts].sort((a, c) => c.cores - a.cores || c.free - a.free);
   // Share threads go where the cores are (they count for more there); XP
   // threads get no core bonus, so they take what's left.
@@ -528,6 +537,41 @@ function startSharing(ns, cfg, st, ledger) {
     lend(ns, st, hosts, "xp", W.xp, R.xp, want.xp - haveRam("xp"), [xpTarget], pieces);
   }
   st.share.xpRate = xpRate(ns, st, ledger);
+}
+
+/**
+ * Give spare threads to prepping rooted servers above your hacking level,
+ * the ones that unlock soonest first. Returns the threads left over.
+ */
+function startPrePrep(ns, st, spare) {
+  const level = ns.getHackingLevel();
+  // Only the next server you'll reach: further ones have much longer
+  // weaken times now than they will once your level is near them, so
+  // prepping them early ties up RAM that levels you faster as XP.
+  for (const lane of st.lanes.values()) if (lane.pre) return spare;
+  const locked = st.hosts
+    .filter((h) => h !== "home" && !h.startsWith("hacknet-") && !st.lanes.has(h) && ns.hasRootAccess(h) && ns.getServerMaxMoney(h) > 0)
+    .map((h) => ({ h, req: ns.getServerRequiredHackingLevel(h) }))
+    .filter((x) => x.req > level && !ns.getServer(x.h).purchasedByPlayer && !isPrepped(ns, x.h))
+    .sort((a, c) => a.req - c.req);
+  for (const { h, req } of locked.slice(0, 1)) {
+    if (spare < 1) break;
+    const m = buildModel(ns, h, st.useFormulas);
+    const need = prepNeeds(ns, m);
+    if (need.total < 1) continue;
+    const take = Math.floor(Math.min(need.total, spare));
+    spare -= take;
+    const lane = newLane(h, "prep");
+    lane.pre = true;
+    lane.req = req;
+    lane.m = m;
+    lane.prepBudget = take;
+    lane.budget = take;
+    st.lanes.set(h, lane);
+    st.modeLog.push({ at: Date.now(), target: h, from: "-", to: "prep", why: `pre-prep: unlocks at hacking ${req}` });
+    if (st.modeLog.length > 60) st.modeLog.shift();
+  }
+  return spare;
 }
 
 /** Start lent workers of one kind on free RAM, up to ramWanted. */
@@ -630,13 +674,21 @@ function xpRate(ns, st, ledger) {
 }
 
 /**
- * Fill home with share threads when it's dedicated to sharing, keeping
- * share.homeKeepFree of it free for your own scripts. Tops up only.
+ * Keep home's own share at the size the ledger set aside for it
+ * (share.homeShareStart, then the 1:1 exchange). Grows as home RAM frees up,
+ * shrinks by stopping the biggest home share workers.
  */
-function shareHome(ns, cfg, st, shareRam) {
+function shareHome(ns, cfg, st, ledger, shareRam) {
+  const want = Math.floor(ledger.homeShareGB / shareRam);
+  const homePids = () => [...st.share.pids.entries()].filter(([, i]) => i.home).sort((a, c) => c[1].threads - a[1].threads);
+  for (const [pid, info] of homePids()) {
+    if ((st.share.homeThreads ?? 0) <= want) break;
+    ns.kill(pid);
+    forgetLent(st, pid, info);
+  }
   const s = ns.getServer("home");
-  const reserve = Math.max(cfg.homeReserveGB, s.maxRam * (cfg.share.homeKeepFree ?? 0.1));
-  const t = Math.floor((s.maxRam - s.ramUsed - reserve) / shareRam);
+  const scripts = Math.min(cfg.homeReserveGB, s.maxRam * cfg.homeReserveMaxFraction);
+  const t = Math.min(want - (st.share.homeThreads ?? 0), Math.floor((s.maxRam - s.ramUsed - scripts) / shareRam));
   if (t < 1) return;
   const pid = ns.exec(cfg.workers.share, "home", { threads: t, temporary: true });
   if (pid > 0) {
@@ -757,6 +809,12 @@ function stepLane(ns, cfg, st, ledger, lane, now, b, TICK, ctx) {
 
   if (lane.mode === "prep") {
     if (lane.pids.size > 0) return 0; // a prep round is still landing
+    if (isPrepped(ns, t) && lane.pre) {
+      // Ready for when your level reaches it; nothing more to do until then.
+      st.modeLog.push({ at: now, target: t, from: "prep", to: "-", why: "pre-prepped, waiting for your level" });
+      st.lanes.delete(t);
+      return 0;
+    }
     if (isPrepped(ns, t)) {
       setMode(st, lane, "batch", "prepped");
       // Its budget was lent out while it prepped; taking it back as the
@@ -812,14 +870,15 @@ function stepLane(ns, cfg, st, ledger, lane, now, b, TICK, ctx) {
   const m = lane.m;
   const tm = times(ns, ctx, t);
   const s = st.spacing;
-  const P = Math.max(plan.P, 4 * s);
+  const gaps = batchGaps(m);
+  const P = Math.max(plan.P, gaps * s);
 
   for (;;) {
     // Earliest landing whose first weaken (landing at L + s) can still launch now.
     const L = Math.max(lane.nextLand, now + tm.weaken + b - s, lane.lastLandEnd + s);
     // Create the batch only when its first weaken is due to launch.
     if (L + s - tm.weaken - b > look) break;
-    if (st.pids.size + queuedCount(st) + 4 > st.slots.cap) break;
+    if (st.pids.size + queuedCount(st) + gaps > st.slots.cap) break;
 
     const pctNow = samplePct(ns, lane, now);
     const pct = predictPct(ns, st, lane, ctx, L, pctNow);
@@ -844,9 +903,16 @@ function stepLane(ns, cfg, st, ledger, lane, now, b, TICK, ctx) {
     };
     lane.batches.set(batch.id, batch);
     lane.queues.hack.push({ kind: "hack", amount: shape.h, land: L, batch, tag: "H" });
-    lane.queues.weaken.push({ kind: "weaken", amount: shape.w1, land: L + s, batch, tag: "W1" });
-    lane.queues.grow.push({ kind: "grow", amount: shape.g, land: L + 2 * s, batch, tag: "G" });
-    lane.queues.weaken.push({ kind: "weaken", amount: shape.w2, land: L + 3 * s, batch, tag: "W2" });
+    if (m.hgw) {
+      // H, G, W: the grow lands one gap after the hack, one weaken after both.
+      batch.hgw = true;
+      lane.queues.grow.push({ kind: "grow", amount: shape.g, land: L + s, batch, tag: "G" });
+      lane.queues.weaken.push({ kind: "weaken", amount: shape.w2, land: L + 2 * s, batch, tag: "W2" });
+    } else {
+      lane.queues.weaken.push({ kind: "weaken", amount: shape.w1, land: L + s, batch, tag: "W1" });
+      lane.queues.grow.push({ kind: "grow", amount: shape.g, land: L + 2 * s, batch, tag: "G" });
+      lane.queues.weaken.push({ kind: "weaken", amount: shape.w2, land: L + 3 * s, batch, tag: "W2" });
+    }
     // The model may predate buying Formulas.exe (no server object yet); the
     // next replan rebuilds it, until then level prediction just skips this batch.
     if (st.useFormulas && ctx.player && m.server) {
@@ -857,7 +923,7 @@ function stepLane(ns, cfg, st, ledger, lane, now, b, TICK, ctx) {
     }
     if (!lane.firstLand) lane.firstLand = L;
     lane.nextLand = L + P;
-    lane.lastLandEnd = L + 3 * s;
+    lane.lastLandEnd = L + (gaps - 1) * s;
     st.session.batches++;
   }
 
@@ -886,7 +952,12 @@ function shapeAt(m, h, pct, topUp = 0, over = 1) {
   const f = Math.min(1 - 1 / m.moneyMax, h * pct * over);
   // topUp: the money is already short by this fraction (a drift), so grow
   // back from (1 - f)(1 - topUp) instead of (1 - f).
-  const g = m.growThreads(Math.min(1 - 1 / m.moneyMax, 1 - (1 - f) * (1 - topUp)));
+  const total = Math.min(1 - 1 / m.moneyMax, 1 - (1 - f) * (1 - topUp));
+  if (m.hgw) {
+    const g = growAfterHack(m, total, h * m.hackSec);
+    return { h, g, w1: 0, w2: Math.ceil((h * m.hackSec + g * m.growSec) / m.weakenPer) };
+  }
+  const g = m.growThreads(total);
   return { h, g, w1: Math.ceil((h * m.hackSec) / m.weakenPer), w2: Math.ceil((g * m.growSec) / m.weakenPer) };
 }
 
@@ -955,7 +1026,7 @@ function launch(ns, cfg, st, ledger, lane, op) {
   if (batch.cancelled || op.amount <= 0) return 0;
   // Never start a hack unless its weakens and grow are already running, and
   // never a grow without the weaken that cleans up after it.
-  if (op.wait && op.tag === "H" && !(batch.launched.has("W1") && batch.launched.has("W2") && batch.launched.has("G"))) {
+  if (op.wait && op.tag === "H" && !((batch.hgw || batch.launched.has("W1")) && batch.launched.has("W2") && batch.launched.has("G"))) {
     batch.cancelled = true;
     return 0;
   }
@@ -988,11 +1059,15 @@ function launch(ns, cfg, st, ledger, lane, op) {
   // Workers wait (up to two gaps) for security to be back at minimum before
   // starting; prep workers don't, since security is high on purpose then.
   const minSec = op.wait ? lane.m.minSec : -1;
-  const maxWait = 2 * st.spacing;
+  // Security stays raised for one gap after a hack or grow lands (HWGW), or
+  // two after a hack (HGW, until the batch's only weaken lands).
+  const maxWait = (batch.hgw ? 3 : 2) * st.spacing;
   let ok = true;
   let n = 0;
   for (const p of pieces) {
-    const pid = ns.exec(cfg.workers[kind], p.host, { threads: p.threads, temporary: true }, lane.target, op.land, batch.id, cfg.ports.reports, minSec, maxWait);
+    const args = [lane.target, op.land, batch.id, cfg.ports.reports, minSec, maxWait];
+    if (kind === "grow" && st.stockGrow.has(lane.target)) args.push(true);
+    const pid = ns.exec(cfg.workers[kind], p.host, { threads: p.threads, temporary: true }, ...args);
     n++;
     if (pid > 0) {
       st.pids.set(pid, { target: lane.target, kind, threads: p.threads, batch, prep: !op.wait, launchedAt: Date.now(), plannedSlack });
@@ -1163,6 +1238,8 @@ function publish(ns, cfg, st, ledger, b) {
         ? { h: l.plan.h, w1: l.plan.w1, g: l.plan.g, w2: l.plan.w2, f: l.plan.f, P: l.plan.P, conc: l.plan.conc, rate: l.plan.rate, inFlight: l.plan.inFlight }
         : null,
     prep: l.mode === "prep" ? l.prep : null,
+    pre: !!l.pre,
+    req: l.req ?? 0,
     workers: l.pids.size,
     money: l.money,
     since: l.started,
@@ -1189,7 +1266,9 @@ function publish(ns, cfg, st, ledger, b) {
     share: {
       threads: st.share.threads,
       homeThreads: st.share.homeThreads ?? 0,
-      homeDedicated: ledger.homeDedicated,
+      homeShareGB: ledger.homeShareGB,
+      homeRam: ns.getServerMaxRam("home"),
+      otherRam: ledger.otherRam,
       power: ns.getSharePower(),
       reserve: st.share.reserve,
       reclaims: st.share.reclaims,

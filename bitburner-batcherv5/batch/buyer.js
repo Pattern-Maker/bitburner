@@ -1,4 +1,4 @@
-import { CONFIG } from "./config.js";
+import { CONFIG, loadConfig } from "./config.js";
 
 /**
  * Buys and upgrades cloud servers, but only while RAM is what's limiting
@@ -13,6 +13,7 @@ import { CONFIG } from "./config.js";
  * @param {NS} ns
  */
 export async function main(ns) {
+  loadConfig(ns);
   ns.disableLog("ALL");
   const cfg = CONFIG.buy;
   const workers = Object.values(CONFIG.workers);

@@ -1,4 +1,4 @@
-import { CONFIG } from "./batch/config.js";
+import { CONFIG, loadConfig } from "./batch/config.js";
 import { scanAll, pathTo } from "./batch/lib.js";
 
 /** Faction servers: backdooring these gets you invitations, so they go first. */
@@ -22,6 +22,7 @@ const FACTION_SERVERS = ["CSEC", "avmnite-02h", "I.I.I.I", "run4theh111z"];
  * @param {NS} ns
  */
 export async function main(ns) {
+  loadConfig(ns);
   ns.disableLog("ALL");
   const doc = document; // the game charges 25 GB for this
   const state = { backdoored: [], current: null, remaining: 0, note: "", via: "terminal" };

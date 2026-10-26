@@ -106,12 +106,18 @@ export const CONFIG = {
     // gets most of it: 10% of the spare RAM gives about four-fifths of the
     // bonus that all of it would.
     xpShareFraction: 0.1,
+    // When spare RAM isn't farming XP, it first preps the next rooted server
+    // you can't hack yet (weaken and grow only need root), so it batches the
+    // moment your level reaches it.
+    prePrep: true,
     reserveFraction: 0.1,
-    // Once home is at most this share of all your RAM, home stops batching
-    // and shares instead (its cores make each share thread worth more).
-    dedicateHomeBelow: 0.1,
-    // When home is dedicated, keep this share of it free for your own scripts.
-    homeKeepFree: 0.1,
+    // Home shares this fraction of its RAM (its cores make each share thread
+    // count for more; homeReserveGB always stays free for your scripts)...
+    homeShareStart: 0.25,
+    // ...and once home is at most this fraction of all your RAM, every GB of
+    // RAM you gain elsewhere frees one more GB of home for sharing, until all
+    // of home shares. Batching RAM stays level during that exchange.
+    homeExchangeBelow: 0.5,
   },
 
   // Coding contract solver (contracts.js): how often to look for new ones.
@@ -122,6 +128,28 @@ export const CONFIG = {
 
   // Hacknet nodes (hacknet.js): buy only what pays for itself within
   // paybackHours, spending at most spendFraction of your money per purchase.
+  // Batch shape. "hwgw": hack, weaken, grow, weaken (4 landings).
+  // "hgw": hack, grow, weaken (3 landings): the grow lands while the hack's
+  // security is still on, so it needs a few more threads on high-security
+  // targets, but each target lands a batch every 3 gaps instead of 4 and
+  // each batch is one script fewer.
+  // In simulation HGW earned 50-85% more when targets were the limit.
+  batchType: "hgw",
+  // Stock trading (batch/stocks.js). Needs no Source-File: it buys market
+  // access itself, then trades long positions on the 4S forecasts.
+  stocks: {
+    enabled: true,
+    // Buy the WSE account + TIX API + 4S TIX API (about $31b in BitNode 1)
+    // once it all costs at most this fraction of your money.
+    accessFraction: 0.1,
+    // At most this fraction of your net worth (cash + shares) in stocks; the
+    // rest stays cash for servers and augmentations.
+    capitalFraction: 0.5,
+    // Buy when the 4S forecast is at least this, sell when it drops below
+    // sellBelow (0.5 is "as likely to fall as rise").
+    buyAbove: 0.55,
+    sellBelow: 0.5,
+  },
   hacknet: {
     enabled: true,
     paybackHours: 2,
@@ -138,7 +166,8 @@ export const CONFIG = {
     singularity: 7105, // singularity -> status
     train: 7106, // train -> status
     contracts: 7107, // contracts -> status
-    hacknet: 7108, // hacknet -> status
+    hacknet: 7108,
+    stocks: 7109, // hacknet -> status
   },
 
   workers: {
@@ -149,3 +178,71 @@ export const CONFIG = {
     xp: "batch/xp.js",
   },
 };
+
+/** Your own settings file. update.js never touches it. */
+export const CONFIG_FILE = "my-config.txt";
+
+export const CONFIG_TEMPLATE = `// Your own settings. update.js never touches this file.
+// Anything here replaces the same setting in batch/config.js, for example:
+//   { "share": { "use": "share" }, "buy": { "spendFraction": 0.5 } }
+// It's JSON: keys in double quotes, no trailing commas. Lines starting with
+// // are ignored. Restart with "run start.js" after changing it.
+{
+}
+`;
+
+/**
+ * Merge my-config.txt over the defaults above (in place, so every module
+ * sees the same settings). Call at the start of every script's main.
+ * With warn, report a broken file or settings that don't exist (typos).
+ */
+export function loadConfig(ns, warn = false) {
+  let text = "";
+  try {
+    text = ns.read(CONFIG_FILE);
+  } catch {
+    return CONFIG;
+  }
+  if (!text || !text.trim()) return CONFIG;
+  let over;
+  try {
+    over = JSON.parse(stripComments(text).trim() || "{}");
+  } catch (e) {
+    if (warn) ns.tprint(`WARNING ${CONFIG_FILE} isn't valid JSON (${e.message}); using the defaults`);
+    return CONFIG;
+  }
+  const unknown = [];
+  merge(CONFIG, over, "", unknown);
+  if (warn && unknown.length) ns.tprint(`WARNING ${CONFIG_FILE}: no such setting ${unknown.join(", ")} (typo?)`);
+  return CONFIG;
+}
+
+function merge(into, from, path, unknown) {
+  if (!from || typeof from !== "object" || Array.isArray(from)) return;
+  for (const [k, v] of Object.entries(from)) {
+    if (!(k in into)) unknown.push(path + k);
+    if (v && typeof v === "object" && !Array.isArray(v) && into[k] && typeof into[k] === "object" && !Array.isArray(into[k])) merge(into[k], v, path + k + ".", unknown);
+    else into[k] = v;
+  }
+}
+
+/** Drop // comments that aren't inside strings. */
+function stripComments(text) {
+  let out = "";
+  let inStr = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      out += c;
+      if (c === "\\") out += text[++i] ?? "";
+      else if (c === '"') inStr = false;
+    } else if (c === '"') {
+      inStr = true;
+      out += c;
+    } else if (c === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i++;
+      out += "\n";
+    } else out += c;
+  }
+  return out;
+}

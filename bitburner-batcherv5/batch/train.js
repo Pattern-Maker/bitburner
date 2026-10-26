@@ -1,4 +1,4 @@
-import { CONFIG } from "./config.js";
+import { CONFIG, loadConfig } from "./config.js";
 
 /**
  * Trains your stats for infiltration. Needs Singularity (Source-File 4 or
@@ -23,6 +23,7 @@ import { CONFIG } from "./config.js";
  * @param {NS} ns
  */
 export async function main(ns) {
+  loadConfig(ns);
   ns.disableLog("ALL");
   const cfg = CONFIG.train;
   const flags = ns.flags([

@@ -1,8 +1,8 @@
-import { CONFIG } from "./batch/config.js";
+import { CONFIG, loadConfig, CONFIG_FILE, CONFIG_TEMPLATE } from "./batch/config.js";
 import { scanAll } from "./batch/lib.js";
 
 const CORE = ["batch/crawler.js", "batch/batcher.js", "batch/status.js"];
-const EXTRAS = ["batch/buyer.js", "batch/contracts.js", "batch/hacknet.js", "batch/singularity.js", "batch/train.js"];
+const EXTRAS = ["batch/buyer.js", "batch/contracts.js", "batch/hacknet.js", "batch/stocks.js", "batch/singularity.js", "batch/train.js"];
 
 /**
  * One script to run everything. Stops old copies, clears leftover workers,
@@ -11,6 +11,9 @@ const EXTRAS = ["batch/buyer.js", "batch/contracts.js", "batch/hacknet.js", "bat
  * @param {NS} ns
  */
 export async function main(ns) {
+  // Your own settings live in my-config.txt, which updates never replace.
+  if (!ns.fileExists(CONFIG_FILE, "home")) ns.write(CONFIG_FILE, CONFIG_TEMPLATE, "w");
+  loadConfig(ns, true);
   ns.disableLog("ALL");
 
   // Singularity (backdoors, home RAM) needs Source-File 4 or BitNode 4.
@@ -23,6 +26,7 @@ export async function main(ns) {
     "batch/buyer.js",
     ...(CONFIG.contracts.enabled ? ["batch/contracts.js"] : []),
     ...(CONFIG.hacknet.enabled ? ["batch/hacknet.js"] : []),
+    ...(CONFIG.stocks?.enabled ? ["batch/stocks.js"] : []),
     ...(hasSingularity ? ["batch/singularity.js"] : []),
   ];
   for (const s of EXTRAS) ns.scriptKill(s, "home");

@@ -1,5 +1,6 @@
 /**
- * Grow worker. Args: target, plannedEnd (ms epoch), id, reportPort.
+ * Grow worker. Args: target, plannedEnd (ms epoch), id, reportPort, minSec,
+ * maxWait, stock.
  *
  * The game applies an operation's effect the moment its timer fires, and
  * timers fire in due-time order even when the game is running late. So the
@@ -9,7 +10,7 @@
  * @param {NS} ns
  */
 export async function main(ns) {
-  const [target, plannedEnd, id, port, minSec = -1, maxWait = 0] = ns.args;
+  const [target, plannedEnd, id, port, minSec = -1, maxWait = 0, stock = false] = ns.args;
   // An operation's duration is fixed when it starts, from the security at
   // that moment. Just after another batch's hack or grow lands, security is
   // briefly raised (until its weaken lands, one gap later), and starting then
@@ -22,6 +23,7 @@ export async function main(ns) {
   const slack = plannedEnd - Date.now() - ns.getGrowTime(target);
   // Starting too late shifts the landing later by -slack ms; the batcher
   // launches earlier when that happens.
-  await ns.grow(target, { additionalMsec: Math.max(0, slack) });
+  // stock: you hold this company's shares, so let the grow push its price up.
+  await ns.grow(target, { additionalMsec: Math.max(0, slack), stock: !!stock });
   ns.writePort(port, { type: "G", pid: ns.pid, id, target, slack, late: Date.now() - plannedEnd, aborted: false, amount: 0 });
 }

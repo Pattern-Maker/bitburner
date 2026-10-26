@@ -1,4 +1,4 @@
-import { CONFIG } from "./batch/config.js";
+import { CONFIG, loadConfig } from "./batch/config.js";
 
 /**
  * Writes a diagnostics report: what every part of the suite is doing and how
@@ -9,6 +9,7 @@ import { CONFIG } from "./batch/config.js";
  * @param {NS} ns
  */
 export async function main(ns) {
+  loadConfig(ns);
   const peek = (port) => {
     const d = ns.peek(port);
     return d === "NULL PORT DATA" ? null : d;
@@ -46,7 +47,7 @@ export async function main(ns) {
     if (b.lateStats) out(`  game lag p50 ${b.lateStats.p50} ms, p99 ${b.lateStats.p99} ms, max ${b.lateStats.max} ms (n=${b.lateStats.n})`);
     if (b.planStats) out(`  planner ${b.planStats.targets} targets, ${b.planStats.ms} ms over ${b.planStats.ticks} ticks`);
     if (b.stalls?.count) out(`  stalls ${b.stalls.count}, last ${Math.round(b.stalls.lastMs / 1000)}s long, ${Math.round((now - b.stalls.lastAt) / 1000)}s ago`);
-    if (b.share) out(`  sharing ${num(b.share.threads)} threads, rep x${b.share.power.toFixed(3)}, reserve ${(b.share.reserve * 100).toFixed(0)}%, reclaims ${b.share.reclaims}`);
+    if (b.share) out(`  sharing ${num(b.share.threads)} threads, rep x${b.share.power.toFixed(3)}, reserve ${(b.share.reserve * 100).toFixed(0)}%, reclaims ${b.share.reclaims}; home shares ${ns.format.ram(b.share.homeShareGB ?? 0)} of ${ns.format.ram(b.share.homeRam ?? 0)} (other RAM ${ns.format.ram(b.share.otherRam ?? 0)})`);
     if (b.share) out(`  spare RAM use: ${b.share.use ?? "share"} (${b.share.why ?? "-"}); XP ${num(b.share.xpThreads ?? 0)} threads on ${b.share.xpTarget ?? "-"}, level ${b.level ?? "?"}`);
     if (b.lastError) out(`  last error ${Math.round((now - b.lastError.at) / 1000)}s ago on ${b.lastError.target}: ${b.lastError.message}`);
     out(`  session $${num(s.money)} in ${ns.format.time(secs * 1000)} ($${num(s.money / secs)}/s), batches ${s.batches}, re-preps ${s.desyncs}, late hacks skipped ${s.aborted}`);
@@ -93,11 +94,12 @@ export async function main(ns) {
     out("");
     out(d ? `${name} (updated ${age(d)}): ${fmt(d)}` : `${name}: not running`);
   };
-  section("Crawler", peek(CONFIG.ports.crawler), (c) => `rooted ${c.rooted}/${c.total}, programs ${c.ownedPrograms}/5${c.nextProgram ? `, next ${c.nextProgram}` : ""}`);
+  section("Crawler", peek(CONFIG.ports.crawler), (c) => `rooted ${c.rooted}/${c.total}, programs ${c.ownedPrograms}/5${c.nextProgram ? `, next ${c.nextProgram}` : ""}${c.bitnode ? `; BitNode: ${JSON.stringify(c.bitnode)}` : ""}`);
   section("Buyer", peek(CONFIG.ports.buyer), (d) => `${d.state}: ${d.note}`);
   section("Singularity", peek(CONFIG.ports.singularity), (d) => `backdoored ${d.backdoored.length}, ${d.remaining ?? 0} left; home: ${d.home?.note ?? "-"}${d.error ? `; error: ${d.error}` : ""}`);
   section("Training", peek(CONFIG.ports.train), (d) => `${d.state} ${d.stat ?? ""} total ${d.total ?? "?"}/${d.goal ?? "?"} ${d.note ?? ""}`);
   section("Contracts", peek(CONFIG.ports.contracts), (d) => `solved ${d.solved}, failed ${d.failed.length}${d.failed.length ? ` (${d.failed.map((f) => f.type).join(", ")})` : ""}, unknown types ${d.unknown.length}`);
+  section("Stocks", peek(CONFIG.ports.stocks), (d) => `${d.state}: ${d.note}; value $${num(d.value ?? 0)}, banked $${num(d.realized ?? 0)}, unrealized $${num(d.unrealized ?? 0)}, trades ${d.trades}; holding ${(d.top ?? []).map((t) => `${t.sym} $${num(t.value)} f=${t.f.toFixed(2)}`).join(", ")}`);
   section("Hacknet", peek(CONFIG.ports.hacknet), (d) => `${d.state}: ${d.nodes ?? 0} nodes, $${num(d.income ?? 0)}/s, bought ${d.bought ?? 0}; ${d.note}`);
 
   // ---- processes and settings ----
