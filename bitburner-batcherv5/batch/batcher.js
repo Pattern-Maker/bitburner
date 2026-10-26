@@ -110,6 +110,13 @@ export async function main(ns) {
       st.stalls.count++;
       st.stalls.lastMs = now - lastLoop;
       st.stalls.lastAt = now;
+      // Everything that was due during a long stall has just landed at once.
+      // The batches created from now on land a weaken time later, so show
+      // that as a refill rather than as a target earning nothing.
+      if (now - lastLoop > 30000) {
+        for (const lane of st.lanes.values()) if (lane.mode === "batch") lane.firstLand = 0;
+        st.stalls.refillFrom = now;
+      }
       st.lates = [];
     }
     lastLoop = now;
@@ -197,7 +204,10 @@ function startReplan(ns, cfg, st, ledger, b) {
   // Launch lag sets the buffer: twice the worst 1% (or worst, with few samples).
   if (st.lags.length >= 20) {
     st.lagStats = pct(st.lags);
-    st.lagP99 = Math.max(0, st.lags.length >= 100 ? st.lagStats.p99 : st.lagStats.max);
+    // With few samples the worst one would set the buffer for a whole cycle;
+    // only let it raise the buffer once there are enough to trust (or, with
+    // nothing measured yet, as a first estimate).
+    if (st.lags.length >= 100 || !(st.lagP99 > 0)) st.lagP99 = Math.max(0, st.lags.length >= 100 ? st.lagStats.p99 : st.lagStats.max);
     st.lags = [];
   }
   st.missStats = { ...st.miss, at: now };
@@ -1184,7 +1194,9 @@ function handleReports(ns, cfg, st, ports) {
     // Lateness only teaches us about timing if it was a batch worker (prep
     // isn't timing-critical) and the game didn't stall while it ran.
     // (The game also needs a moment after a stall to catch up on its backlog.)
-    const fairTiming = info && !info.prep && info.launchedAt > st.lastStallAt + 3000;
+    // After a long stall the game spends a while working through everything
+    // that came due, so give it a tenth of the stall (at least 3 s) to settle.
+    const fairTiming = info && !info.prep && info.launchedAt > st.lastStallAt + Math.max(3000, (st.stalls.lastMs ?? 0) / 10);
     if (fairTiming && !r.aborted && r.late > 0) st.lates.push(r.late);
     if (st.lates.length > 2000) st.lates.splice(0, st.lates.length - 2000);
     if (fairTiming && typeof r.slack === "number" && info.plannedSlack != null) {
@@ -1301,8 +1313,13 @@ function sweep(ns, st) {
   for (const [pid, info] of st.gone) {
     if (info.goneAt < st.lastSweepAt) {
       st.gone.delete(pid);
-      st.lostReports++;
-      if (info.kind === "hack") st.lostHackReports++;
+      // Right after a stall everything that was due lands at once and can
+      // overflow the ports; that's expected, so count it apart.
+      if (info.goneAt < st.lastStallAt + 10000) st.lostAfterStall = (st.lostAfterStall ?? 0) + 1;
+      else {
+        st.lostReports++;
+        if (info.kind === "hack") st.lostHackReports++;
+      }
     }
   }
   for (const [pid, info] of st.pids) {
@@ -1364,6 +1381,7 @@ function publish(ns, cfg, st, ledger, b) {
     actualSpan: now - first.t,
     lostReports: st.lostReports,
     lostHackReports: st.lostHackReports,
+    lostAfterStall: st.lostAfterStall ?? 0,
     updated: Date.now(),
     formulas: st.useFormulas,
     spacing: st.spacing,

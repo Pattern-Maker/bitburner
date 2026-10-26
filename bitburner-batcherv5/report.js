@@ -50,7 +50,7 @@ export async function main(ns) {
     if (b.share) out(`  sharing ${num(b.share.threads)} threads, rep x${b.share.power.toFixed(3)}, reserve ${(b.share.reserve * 100).toFixed(0)}%, reclaims ${b.share.reclaims}; home shares ${ns.format.ram(b.share.homeShareGB ?? 0)} of ${ns.format.ram(b.share.homeRam ?? 0)} (other RAM ${ns.format.ram(b.share.otherRam ?? 0)})`);
     if (b.share) out(`  spare RAM use: ${b.share.use ?? "share"} (${b.share.why ?? "-"}); XP ${num(b.share.xpThreads ?? 0)} threads on ${b.share.xpTarget ?? "-"}, level ${b.level ?? "?"}`);
     if (b.lastError) out(`  last error ${Math.round((now - b.lastError.at) / 1000)}s ago on ${b.lastError.target}: ${b.lastError.message}`);
-    out(`  actual hacking income (game's count) $${num(b.actualRate ?? 0)}/s over ${Math.round((b.actualSpan ?? 0) / 1000)}s; lost reports ${b.lostReports ?? 0} (hacks ${b.lostHackReports ?? 0})`);
+    out(`  actual hacking income (game's count) $${num(b.actualRate ?? 0)}/s over ${Math.round((b.actualSpan ?? 0) / 1000)}s; lost reports ${b.lostReports ?? 0} (hacks ${b.lostHackReports ?? 0}), ${b.lostAfterStall ?? 0} more right after stalls`);
     out(`  session $${num(s.money)} in ${ns.format.time(secs * 1000)} ($${num(s.money / secs)}/s), batches ${s.batches}, re-preps ${s.desyncs}, late hacks skipped ${s.aborted}`);
     let expected = 0;
     for (const l of b.lanes) {

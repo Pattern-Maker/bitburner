@@ -84,7 +84,7 @@ function render(ns, f, money) {
     if (b.stalls && b.stalls.count > 0) {
       const ago = f.time(now - b.stalls.lastAt);
       ns.print(`  Stalls      game paused ${b.stalls.count}x, last for ${f.time(b.stalls.lastMs)} (${ago} ago)`);
-      if (now - b.stalls.lastAt < 120000) ns.print(`              (background browser tab? keep the game visible)`);
+      if (now - b.stalls.lastAt < 120000) ns.print(`              (computer asleep, or the game minimised or in a background tab? keep it running)`);
     }
     ns.print("");
     ns.print(`== Targets ==`);
@@ -100,7 +100,8 @@ function render(ns, f, money) {
         expected += p.rate * 1000;
         ns.print(`      ${p.w1 > 0 ? `H${p.h} W${p.w1} G${p.g} W${p.w2}` : `H${p.h} G${p.g} W${p.w2}`}  takes ${f.percent(p.f, 2)}, one every ${Math.round(p.P)} ms, ~${p.inFlight} in flight`);
         if (!l.firstLand || now < l.firstLand) {
-          const wait = l.firstLand ? `first batch lands in ${f.time(l.firstLand - now)}` : "starting";
+          const after = b.stalls?.refillFrom && now - b.stalls.refillFrom < 3600000 && l.firstLand ? "refilling after the game stalled, " : "";
+          const wait = l.firstLand ? `${after}first batch lands in ${f.time(l.firstLand - now)}` : "starting";
           ns.print(`      ${f.number(p.conc, 0)} threads   expect ${money(p.rate * 1000)}/s   filling pipeline: ${wait}`);
         } else {
           ns.print(`      ${f.number(p.conc, 0)} threads   expect ${money(p.rate * 1000)}/s${earned}`);
@@ -121,6 +122,7 @@ function render(ns, f, money) {
     ns.print(`  Expected    ${money(expected)}/s from batching targets`);
     ns.print(`  Session     ${money(s.money)} in ${f.time(elapsed * 1000)}  (${money(s.money / elapsed)}/s)`);
     if (b.actualSpan > 5000) ns.print(`  Actual      ${money(b.actualRate)}/s hacking income over the last ${f.time(b.actualSpan)} (the game's own count)`);
+    if (b.lostAfterStall > 0) ns.print(`              ${f.number(b.lostAfterStall, 0)} reports lost when everything due during a stall landed at once (the money was still made)`);
     if (b.lostReports > 0) ns.print(`  Lost        ${f.number(b.lostReports, 0)} worker reports (${f.number(b.lostHackReports, 0)} hacks): a report port overflowed, so "got" undercounts`);
     const notes = [];
     if (s.desyncs) notes.push(`${s.desyncs} re-preps`);
