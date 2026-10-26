@@ -120,6 +120,8 @@ function render(ns, f, money) {
     ns.print(`== Income ==`);
     ns.print(`  Expected    ${money(expected)}/s from batching targets`);
     ns.print(`  Session     ${money(s.money)} in ${f.time(elapsed * 1000)}  (${money(s.money / elapsed)}/s)`);
+    if (b.actualSpan > 5000) ns.print(`  Actual      ${money(b.actualRate)}/s hacking income over the last ${f.time(b.actualSpan)} (the game's own count)`);
+    if (b.lostReports > 0) ns.print(`  Lost        ${f.number(b.lostReports, 0)} worker reports (${f.number(b.lostHackReports, 0)} hacks): a report port overflowed, so "got" undercounts`);
     const notes = [];
     if (s.desyncs) notes.push(`${s.desyncs} re-preps`);
     if (b.repairs) notes.push(`${b.repairs} drifts repaired without re-prep`);

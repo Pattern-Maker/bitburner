@@ -39,8 +39,9 @@ export async function main(ns) {
     share: W.share ? ns.getScriptRam(W.share, "home") : 0,
     xp: W.xp ? ns.getScriptRam(W.xp, "home") : 0,
   };
-  const port = cfg.ports.reports;
-  ns.clearPort(port);
+  const reportPorts = [];
+  for (let i = 0; i < (cfg.ports.reportPorts ?? 1); i++) reportPorts.push(cfg.ports.reports + i);
+  for (const p of reportPorts) ns.clearPort(p);
   const ledger = new Ledger(ns, cfg, scriptRam, files);
 
   const TICK = 10; // ms between loop passes; workers time themselves, so this only sets launch lookahead
@@ -84,6 +85,11 @@ export async function main(ns) {
     incomeLog: [], // { t, money } in 10 s buckets for the last 30 minutes
     repairs: 0,
     stockGrow: new Set(), // servers whose grows run with { stock: true }
+    gone: new Map(), // pid -> info: ended without a report yet (see sweep)
+    lastSweepAt: 0,
+    lostReports: 0,
+    lostHackReports: 0,
+    hackIncome: [], // { t, total } samples of the game's own hacking income count
   };
   // Home's share, in GB, as the ledger needs it to keep that RAM out of batching.
   Object.defineProperty(ledger, "homeShareHeld", { get: () => (st.share.homeThreads ?? 0) * scriptRam.share });
@@ -120,7 +126,7 @@ export async function main(ns) {
       lastRefresh = now;
     }
 
-    handleReports(ns, cfg, st, port);
+    handleReports(ns, cfg, st, reportPorts);
 
     // Planning runs a few ms per tick so it never delays launches.
     if (st.planner) stepPlanner(ns, cfg, st, ledger, 4);
@@ -737,13 +743,18 @@ function xpRate(ns, st, ledger) {
 function shareHome(ns, cfg, st, ledger, shareRam) {
   const want = Math.floor(ledger.homeShareGB / shareRam);
   const homePids = () => [...st.share.pids.entries()].filter(([, i]) => i.home).sort((a, c) => c[1].threads - a[1].threads);
+  let s = ns.getServer("home");
+  const scripts = Math.min(cfg.homeReserveGB, s.maxRam * cfg.homeReserveMaxFraction);
+  // Your own scripts come first: if they've eaten into the free RAM home
+  // keeps for them, give share threads back (and re-share what's left below).
+  let short = scripts - (s.maxRam - s.ramUsed);
   for (const [pid, info] of homePids()) {
-    if ((st.share.homeThreads ?? 0) <= want) break;
+    if ((st.share.homeThreads ?? 0) <= want && short <= 0) break;
     ns.kill(pid);
     forgetLent(st, pid, info);
+    short -= info.threads * shareRam;
   }
-  const s = ns.getServer("home");
-  const scripts = Math.min(cfg.homeReserveGB, s.maxRam * cfg.homeReserveMaxFraction);
+  s = ns.getServer("home");
   const t = Math.min(want - (st.share.homeThreads ?? 0), Math.floor((s.maxRam - s.ramUsed - scripts) / shareRam));
   if (t < 1) return;
   const pid = ns.exec(cfg.workers.share, "home", { threads: t, temporary: true });
@@ -1137,7 +1148,7 @@ function launch(ns, cfg, st, ledger, lane, op) {
   let ok = true;
   let n = 0;
   for (const p of pieces) {
-    const args = [lane.target, op.land, batch.id, cfg.ports.reports, minSec, maxWait];
+    const args = [lane.target, op.land, batch.id, cfg.ports.reports + (batch.id % (cfg.ports.reportPorts ?? 1)), minSec, maxWait];
     if (kind === "grow" && st.stockGrow.has(lane.target)) args.push(true);
     const pid = ns.exec(cfg.workers[kind], p.host, { threads: p.threads, temporary: true }, ...args);
     n++;
@@ -1160,10 +1171,14 @@ function launch(ns, cfg, st, ledger, lane, op) {
 
 // ---------------------------------------------------------------- reports ---
 
-function handleReports(ns, cfg, st, port) {
-  for (const r of drainPort(ns, port)) {
-    const info = st.pids.get(r.pid);
+function handleReports(ns, cfg, st, ports) {
+  const reports = [];
+  for (const p of ports) for (const r of drainPort(ns, p)) reports.push(r);
+  for (const r of reports) {
+    // A report that arrives after sweep() saw its worker end still counts.
+    const info = st.pids.get(r.pid) ?? st.gone.get(r.pid);
     st.pids.delete(r.pid);
+    st.gone.delete(r.pid);
     const lane = st.lanes.get(r.target);
     if (lane) lane.pids.delete(r.pid);
     // Lateness only teaches us about timing if it was a batch worker (prep
@@ -1281,12 +1296,24 @@ function handleReports(ns, cfg, st, port) {
 
 /** Catch workers that ended without reporting (killed, crashed, full port). */
 function sweep(ns, st) {
+  // Workers seen ended at the previous sweep that still haven't reported:
+  // their report was lost (a full port drops its oldest message).
+  for (const [pid, info] of st.gone) {
+    if (info.goneAt < st.lastSweepAt) {
+      st.gone.delete(pid);
+      st.lostReports++;
+      if (info.kind === "hack") st.lostHackReports++;
+    }
+  }
   for (const [pid, info] of st.pids) {
     if (!ns.isRunning(pid)) {
       st.pids.delete(pid);
       st.lanes.get(info.target)?.pids.delete(pid);
+      info.goneAt = Date.now();
+      st.gone.set(pid, info);
     }
   }
+  st.lastSweepAt = Date.now();
 }
 
 // ----------------------------------------------------------------- status ---
@@ -1324,8 +1351,19 @@ function publish(ns, cfg, st, ledger, b) {
     cash: ns.getServerMoneyAvailable(l.target),
     maxCash: ns.getServerMaxMoney(l.target),
   }));
+  // Hacking income as the game itself counts it, independent of reports.
+  const now = Date.now();
+  const total = ns.getMoneySources().sinceInstall.hacking;
+  st.hackIncome.push({ t: now, total });
+  while (st.hackIncome.length > 2 && st.hackIncome[0].t < now - 60000) st.hackIncome.shift();
+  const first = st.hackIncome[0];
+  const actualRate = now > first.t ? ((total - first.total) / (now - first.t)) * 1000 : 0;
   ns.clearPort(cfg.ports.batcher);
   ns.writePort(cfg.ports.batcher, {
+    actualRate,
+    actualSpan: now - first.t,
+    lostReports: st.lostReports,
+    lostHackReports: st.lostHackReports,
     updated: Date.now(),
     formulas: st.useFormulas,
     spacing: st.spacing,

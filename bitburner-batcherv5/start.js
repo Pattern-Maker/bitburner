@@ -34,7 +34,7 @@ export async function main(ns) {
   for (const s of SERVICES) ns.scriptKill(s, "home");
   const { hosts } = scanAll(ns);
   for (const h of hosts) for (const w of Object.values(CONFIG.workers)) ns.scriptKill(w, h);
-  for (const p of Object.values(CONFIG.ports)) ns.clearPort(p);
+  for (const [k, p] of Object.entries(CONFIG.ports)) if (k !== "reportPorts") ns.clearPort(p);
 
   if (!launch(ns, SERVICES[0])) return;
   // Wait for the crawler's first pass so the batcher sees rooted servers.

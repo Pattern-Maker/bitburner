@@ -9,7 +9,7 @@
 export const CONFIG = {
   // RAM on home kept free for your own scripts. Capped at a share of home so
   // the reserve never swallows a small early-game home computer.
-  homeReserveGB: 32,
+  homeReserveGB: 64,
   homeReserveMaxFraction: 0.25,
 
   // Gap between landings inside a batch (ms). The game resolves landings in
@@ -159,15 +159,19 @@ export const CONFIG = {
 
   // Port numbers used for communication. Change only if they clash with yours.
   ports: {
-    reports: 7101, // workers -> batcher (finish times, money taken)
+    // workers -> batcher (finish times, money taken). Spread over reportPorts
+    // ports from here, because a port only holds 50 messages (the game's
+    // "Netscript port size" option) and silently drops the oldest when full.
+    reports: 7200,
+    reportPorts: 32,
     batcher: 7102, // batcher -> status
     crawler: 7103, // crawler -> status / start
     buyer: 7104, // buyer -> status
     singularity: 7105, // singularity -> status
     train: 7106, // train -> status
     contracts: 7107, // contracts -> status
-    hacknet: 7108,
-    stocks: 7109, // hacknet -> status
+    hacknet: 7108, // hacknet -> status
+    stocks: 7109, // stocks -> status / batcher
   },
 
   workers: {
