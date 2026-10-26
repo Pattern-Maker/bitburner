@@ -34,7 +34,7 @@ export const CONFIG = {
 
   // Most worker scripts allowed to run at once. Thousands of tiny scripts can
   // slow the game down; raise this if your machine copes, lower it if it lags.
-  maxWorkerScripts: 10000,
+  maxWorkerScripts: 30000,
 
   // How often the crawler rescans the network and tries to root servers.
   crawlIntervalMs: 30000,
@@ -64,15 +64,41 @@ export const CONFIG = {
     intervalMs: 30000,
   },
 
-  // Stat training for infiltration (train.js, needs Source-File 4). You start
-  // it yourself, since it takes over what your character is doing.
+  // Stat training for infiltration (train.js, needs Source-File 4). It takes
+  // over what your character is doing, so it stops by itself if you start
+  // something else, and start.js won't restart it.
   // level: the infiltration difficulty to reach (trivial, normal or hard).
   // focus: focusing trains faster but takes over the screen.
   // roundSec: how long each stat is trained before picking again.
   train: {
+    autoStart: true, // start.js starts training (only with Singularity)
     level: "normal",
     focus: false,
     roundSec: 60,
+  },
+
+  // RAM the batching plan can't use is lent to your factions with
+  // ns.share(), which multiplies faction rep gain while you work for one by
+  // 1 + ln(threads) / 25 (1 million threads is about +55%). reserveFraction of
+  // your threads is always kept free so batches never wait for RAM.
+  share: {
+    enabled: true,
+    reserveFraction: 0.1,
+  },
+
+  // Coding contract solver (contracts.js): how often to look for new ones.
+  contracts: {
+    enabled: true,
+    intervalMs: 60000,
+  },
+
+  // Hacknet nodes (hacknet.js): buy only what pays for itself within
+  // paybackHours, spending at most spendFraction of your money per purchase.
+  hacknet: {
+    enabled: true,
+    paybackHours: 2,
+    spendFraction: 0.1,
+    intervalMs: 10000,
   },
 
   // Port numbers used for communication. Change only if they clash with yours.
@@ -83,11 +109,14 @@ export const CONFIG = {
     buyer: 7104, // buyer -> status
     singularity: 7105, // singularity -> status
     train: 7106, // train -> status
+    contracts: 7107, // contracts -> status
+    hacknet: 7108, // hacknet -> status
   },
 
   workers: {
     hack: "batch/hack.js",
     grow: "batch/grow.js",
     weaken: "batch/weaken.js",
+    share: "batch/share.js",
   },
 };

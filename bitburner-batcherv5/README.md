@@ -13,6 +13,7 @@ run start.js
 | `start.js` | Starts everything, restarts anything that stops | ~4 GB |
 | `cleanup.js` | Removes leftover scripts from every server | ~3 GB |
 | `update.js` | Downloads the latest scripts from the GitHub repo | ~6 GB |
+| `report.js` | Writes a diagnostics report to paste to Claude | ~3 GB |
 | `batch/config.js` | Your preferences (home reserve, script cap, ports) | – |
 | `batch/lib.js` | Scanning, rooting, RAM ledger, model and solvers | – |
 | `batch/crawler.js` | Roots servers every 30 s and copies workers out | ~5 GB |
@@ -20,10 +21,14 @@ run start.js
 | `batch/status.js` | Live tail window | ~1.6 GB |
 | `batch/buyer.js` | Buys and upgrades cloud servers while RAM is the bottleneck | ~6 GB |
 | `batch/singularity.js` | Backdoors and home RAM upgrades (needs Source-File 4) | varies |
-| `batch/train.js` | Trains stats for infiltration; you start it yourself (needs Source-File 4) | varies |
+| `batch/train.js` | Trains stats for infiltration (needs Source-File 4) | varies |
+| `batch/contracts.js` | Finds and solves coding contracts | ~25 GB |
+| `batch/solvers.js` | The contract solvers | – |
+| `batch/hacknet.js` | Buys hacknet nodes and upgrades that pay back within 2 hours | ~7 GB |
 | `batch/hack.js`, `grow.js`, `weaken.js` | Workers | 1.85–1.9 GB per thread |
+| `batch/share.js` | Share worker: lends spare RAM to factions | 4 GB per thread |
 
-All of it needs roughly 25 GB on home.
+All of it needs roughly 60 GB on home.
 
 ## Updating
 
@@ -97,8 +102,9 @@ str + def + dex + agi + cha, so each round it trains whichever stat gains the
 most levels, at the best gym or university for it. It shows the exact stat
 total each location needs and a real ETA (levels slow down as they rise, so
 it simulates the rest of the training rather than extrapolating). It isn't
-started by start.js, because it takes over what your character is doing; it
-stops itself when done, or if you start other work.
+started by start.js when you have Singularity, but never restarted: it takes
+over what your character is doing, so it stops itself when done, or if you
+start other work.
 
 ```
 run batch/train.js                    work through locations, easiest first
@@ -107,8 +113,26 @@ run batch/train.js --level hard       trivial | normal (default) | hard
 run batch/train.js --focus            faster, but takes over the screen
 ```
 
+**Sharing.** RAM the plan can't use is lent to your factions with
+`ns.share()`. While you do faction work, rep gain is multiplied by
+1 + ln(threads)/25 (a million threads is about +55%). If batches ever need
+the RAM, they take back just what they need, and the batcher lends less from
+then on, easing back over time. Turn it off with `share.enabled`.
+
+**Contracts.** `contracts.js` solves every contract type in 3.0.x. Each
+solver was checked against the game's own generator and answer checker on
+2,000 random contracts per type. A contract it gets wrong is never retried,
+so a bad solver can't destroy contracts.
+
+**Hacknet.** `hacknet.js` buys whatever adds the most income per dollar, but
+only if it pays for itself within `hacknet.paybackHours`.
+
+**Diagnostics.** `run report.js` prints everything the suite knows about how
+it's doing (and saves it to `report.txt`) for pasting into a chat with Claude.
+
 ## What's left to you
 
-Buying port openers and Formulas.exe, and (without Source-File 4) home RAM
-and backdoors. The status window says what to buy next and gives the exact
+Buying TOR, port openers and Formulas.exe, and (without Source-File 4) home
+RAM, backdoors, training and faction work: the game only lets scripts do
+those through Singularity. The status window says what to buy next and gives the exact
 `connect` path for each backdoor.

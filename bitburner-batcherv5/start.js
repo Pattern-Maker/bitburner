@@ -2,7 +2,7 @@ import { CONFIG } from "./batch/config.js";
 import { scanAll } from "./batch/lib.js";
 
 const CORE = ["batch/crawler.js", "batch/batcher.js", "batch/status.js"];
-const EXTRAS = ["batch/buyer.js", "batch/singularity.js"];
+const EXTRAS = ["batch/buyer.js", "batch/contracts.js", "batch/hacknet.js", "batch/singularity.js", "batch/train.js"];
 
 /**
  * One script to run everything. Stops old copies, clears leftover workers,
@@ -16,7 +16,15 @@ export async function main(ns) {
   // Singularity (backdoors, home RAM) needs Source-File 4 or BitNode 4.
   const reset = ns.getResetInfo();
   const hasSingularity = reset.currentNode === 4 || (reset.ownedSF.get(4) ?? 0) > 0;
-  const SERVICES = [...CORE, "batch/buyer.js", ...(hasSingularity ? ["batch/singularity.js"] : [])];
+  // Services are restarted if they stop. train.js isn't one: it ends by
+  // itself when training is done or you take over, and shouldn't come back.
+  const SERVICES = [
+    ...CORE,
+    "batch/buyer.js",
+    ...(CONFIG.contracts.enabled ? ["batch/contracts.js"] : []),
+    ...(CONFIG.hacknet.enabled ? ["batch/hacknet.js"] : []),
+    ...(hasSingularity ? ["batch/singularity.js"] : []),
+  ];
   for (const s of EXTRAS) ns.scriptKill(s, "home");
 
   for (const s of SERVICES) ns.scriptKill(s, "home");
@@ -30,8 +38,11 @@ export async function main(ns) {
   if (!launch(ns, SERVICES[1])) return;
   launch(ns, SERVICES[2], "--tail");
   for (const s of SERVICES.slice(3)) launch(ns, s);
+  if (hasSingularity && CONFIG.train.autoStart) launch(ns, "batch/train.js");
   ns.tprint("Batching suite started. The status window shows what it's doing.");
-  if (!hasSingularity) ns.tprint("No Singularity (Source-File 4), so backdoors and home RAM stay manual.");
+  if (!hasSingularity) {
+    ns.tprint("No Singularity (Source-File 4): backdoors, home RAM, training, faction work and buying programs stay manual.");
+  }
 
   // Restart anything that stops, but give up on a script that keeps crashing
   // (3 times in 2 minutes) instead of throwing up an error dialog every 5 s.

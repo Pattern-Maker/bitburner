@@ -35,6 +35,7 @@ export async function main(ns) {
     hack: ns.getScriptRam(W.hack, "home"),
     grow: ns.getScriptRam(W.grow, "home"),
     weaken: ns.getScriptRam(W.weaken, "home"),
+    share: W.share ? ns.getScriptRam(W.share, "home") : 0,
   };
   const port = cfg.ports.reports;
   ns.clearPort(port);
@@ -61,6 +62,9 @@ export async function main(ns) {
     // timing, so their lateness is ignored.
     lastStallAt: 0,
     stalls: { count: 0, lastMs: 0, lastAt: 0 },
+    // pids: pid -> { host, threads }. reserve: share of threads kept unlent;
+    // it grows each time batches had to reclaim shared RAM, and eases back.
+    share: { pids: new Map(), threads: 0, reserve: cfg.share?.reserveFraction ?? 0.1, reclaims: 0 },
   };
   const buffer = () => 4 * st.spacing + Math.ceil(st.msPerExec * 8) + 2 * TICK;
 
@@ -103,7 +107,18 @@ export async function main(ns) {
     let execs = 0;
     const ctx = tickContext(ns, st);
     for (const lane of [...st.lanes.values()]) {
-      execs += stepLane(ns, cfg, st, ledger, lane, now, buffer(), TICK, ctx);
+      // One target's problem must never take the whole batcher down: record
+      // it, let that lane's workers land, and carry on with the rest.
+      try {
+        execs += stepLane(ns, cfg, st, ledger, lane, now, buffer(), TICK, ctx);
+      } catch (e) {
+        st.lastError = { at: Date.now(), target: lane.target, message: String(e?.message ?? e) };
+        ns.print(`ERROR on ${lane.target}: ${st.lastError.message}`);
+        lane.mode = "drain";
+        lane.firstLand = 0;
+        cancelQueued(lane);
+        requestReplan(st);
+      }
     }
     if (execs > 0) st.msPerExec = 0.8 * st.msPerExec + 0.2 * Math.max(0.05, (Date.now() - execT0) / execs);
 
@@ -128,6 +143,7 @@ export async function main(ns) {
  */
 function startReplan(ns, cfg, st, ledger, b) {
   const now = Date.now();
+  stopSharing(ns, st); // the plan gets first claim on all RAM
   st.hosts = scanAll(ns).hosts;
   ledger.refresh(st.hosts);
   st.ramKey = ledger.hosts.map((h) => `${h.host}:${h.maxRam}`).join(",");
@@ -347,6 +363,64 @@ function finishPlan(ns, cfg, st, ledger) {
   const cycles = [...st.lanes.values()].filter((l) => l.m).map((l) => l.m.weakenTime + b);
   st.nextReplan = st.replanAsked ? now : now + Math.max(2000, Math.min(60000, ...cycles));
   st.replanAsked = false;
+  startSharing(ns, cfg, st, ledger);
+}
+
+/**
+ * Lend the threads the plan can't use to factions. Never more than the
+ * plan's spare (capacity minus what it uses, minus a reserve), so batches
+ * still find room as the pipeline fills. Grow-style core bonuses apply, so
+ * servers with more cores go first.
+ */
+function startSharing(ns, cfg, st, ledger) {
+  const W = cfg.workers;
+  if (!cfg.share?.enabled || !W.share || !st.usage) return;
+  const shareRam = ledger.scriptRam.share;
+  if (!(shareRam > 0)) return;
+  // What every lane needs: the larger of its plan and what its workers hold
+  // right now (batches from the previous plan, or a target that's draining).
+  const held = new Map();
+  for (const info of st.pids.values()) held.set(info.target, (held.get(info.target) ?? 0) + info.threads);
+  let needed = 0;
+  for (const lane of st.lanes.values()) {
+    const h = held.get(lane.target) ?? 0;
+    if (lane.mode === "batch" && lane.plan) needed += Math.max(lane.plan.conc, h);
+    // A draining target will want its whole budget again once it re-preps.
+    else if (lane.mode === "prep" || lane.mode === "drain") needed += Math.max(lane.budget ?? lane.prepBudget ?? 0, h);
+    else needed += h;
+  }
+  // Ease the reserve back towards the configured level after a quiet plan.
+  st.share.reserve = Math.max(cfg.share.reserveFraction, st.share.reserve * 0.9);
+  const spareThreads = st.usage.capacity - needed - st.share.reserve * st.usage.capacity;
+  let ramLeft = spareThreads * ledger.threadRam;
+  if (ramLeft < shareRam) return;
+  ledger.refresh(st.hosts);
+  for (const h of [...ledger.hosts].sort((a, c) => c.cores - a.cores || c.free - a.free)) {
+    const t = Math.floor(Math.min(h.free, ramLeft) / shareRam);
+    if (t < 1) continue;
+    const pid = ns.exec(W.share, h.host, { threads: t, temporary: true });
+    if (pid > 0) {
+      st.share.pids.set(pid, { host: h.host, threads: t });
+      st.share.threads += t;
+      h.free -= t * shareRam;
+      ramLeft -= t * shareRam;
+    }
+    if (ramLeft < shareRam) break;
+  }
+}
+
+/** Take shared RAM back: all of it, or (with ramNeeded) just enough, biggest first. */
+function stopSharing(ns, st, ramNeeded = Infinity, shareRam = 0) {
+  let freed = 0;
+  const byBiggest = [...st.share.pids.entries()].sort((a, c) => c[1].threads - a[1].threads);
+  for (const [pid, info] of byBiggest) {
+    if (freed >= ramNeeded) break;
+    ns.kill(pid);
+    st.share.pids.delete(pid);
+    st.share.threads -= info.threads;
+    freed += info.threads * shareRam;
+  }
+  if (st.share.pids.size === 0) st.share.threads = 0;
 }
 
 /** Ask for a replan as soon as possible (after the one being built, if any). */
@@ -495,7 +569,9 @@ function stepLane(ns, cfg, st, ledger, lane, now, b, TICK, ctx) {
     lane.queues.weaken.push({ kind: "weaken", amount: shape.w1, land: L + s, batch, tag: "W1" });
     lane.queues.grow.push({ kind: "grow", amount: shape.g, land: L + 2 * s, batch, tag: "G" });
     lane.queues.weaken.push({ kind: "weaken", amount: shape.w2, land: L + 3 * s, batch, tag: "W2" });
-    if (st.useFormulas) {
+    // The model may predate buying Formulas.exe (no server object yet); the
+    // next replan rebuilds it, until then level prediction just skips this batch.
+    if (st.useFormulas && ctx.player && m.server) {
       const e = ns.formulas.hacking.hackExp(m.server, ctx.player);
       const exp = e * (shape.h * (m.chance + (1 - m.chance) / 4) + shape.g + shape.w1 + shape.w2);
       st.pendingExp.push({ land: L, exp });
@@ -592,7 +668,17 @@ function launch(ns, cfg, st, ledger, lane, op) {
     batch.cancelled = true;
     return 0;
   }
-  const pieces = op.pieces ?? ledger.plan(kind, op.amount);
+  let pieces = op.pieces ?? ledger.plan(kind, op.amount);
+  if (!pieces && st.share.pids.size > 0) {
+    // Shared RAM is lent, not given: take back what this needs (with some
+    // room to spare), lend less from now on, and try once more.
+    const need = op.amount * ledger.scriptRam[kind] * 2;
+    stopSharing(ns, st, need, ledger.scriptRam.share);
+    st.share.reserve = Math.min(0.5, st.share.reserve * 1.5);
+    st.share.reclaims++;
+    ledger.refresh(st.hosts);
+    pieces = ledger.plan(kind, op.amount);
+  }
   if (!pieces) {
     // Not enough RAM right now. Everything already launched for this batch
     // is harmless on its own, so just drop the rest of it.
@@ -751,6 +837,8 @@ function publish(ns, cfg, st, ledger, b) {
     lateStats: st.lateStats ?? null,
     planStats: st.planStats ?? null,
     planning: !!st.planner,
+    lastError: st.lastError ?? null,
+    share: { threads: st.share.threads, power: ns.getSharePower(), reserve: st.share.reserve, reclaims: st.share.reclaims },
     usage: st.usage ?? null,
     buffer: b,
     capacity: st.capacity,

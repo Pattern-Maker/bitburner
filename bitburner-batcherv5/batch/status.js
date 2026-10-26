@@ -48,6 +48,11 @@ function render(ns, f, money) {
         ns.print(`              slots are the limit, not RAM: raise maxWorkerScripts if lateness stays low`);
       }
     }
+    if (b.share) {
+      const sh = b.share;
+      if (sh.threads > 0) ns.print(`  Sharing     ${f.number(sh.threads, 0)} spare threads: faction rep x${sh.power.toFixed(3)} while you work for a faction`);
+      else if (sh.reserve > 0.11) ns.print(`  Sharing     holding back ${f.percent(sh.reserve, 0)} of threads after batches needed RAM`);
+    }
     ns.print(`  Timing      ${b.spacing} ms gap, ${b.buffer} ms launch buffer, replan in ${f.time(Math.max(0, b.nextReplan - now))}`);
     if (b.lateStats) {
       const L = b.lateStats;
@@ -56,6 +61,9 @@ function render(ns, f, money) {
     if (b.planStats) {
       const p = b.planStats;
       ns.print(`  Planner     ${p.targets} targets weighed in ${f.time(p.ms)} over ${p.ticks} ticks${b.planning ? "  (replanning now)" : ""}`);
+    }
+    if (b.lastError && now - b.lastError.at < 600000) {
+      ns.print(`  Error       ${b.lastError.target}: ${b.lastError.message} (${f.time(now - b.lastError.at)} ago, recovered)`);
     }
     if (b.stalls && b.stalls.count > 0) {
       const ago = f.time(now - b.stalls.lastAt);
@@ -102,12 +110,21 @@ function render(ns, f, money) {
 
   const buyer = ns.peek(CONFIG.ports.buyer);
   const sing = ns.peek(CONFIG.ports.singularity);
-  if (buyer !== "NULL PORT DATA" || sing !== "NULL PORT DATA") {
+  if ([CONFIG.ports.buyer, CONFIG.ports.singularity, CONFIG.ports.contracts, CONFIG.ports.hacknet].some((p) => ns.peek(p) !== "NULL PORT DATA")) {
     ns.print("");
     ns.print(`== Automation ==`);
     if (buyer !== "NULL PORT DATA") {
       const next = buyer.next ? `; next: ${buyer.next.what} for ${money(buyer.next.cost)}` : "";
       ns.print(`  Cloud RAM   ${buyer.state}: ${buyer.note}${buyer.state === "bought" ? "" : next}`);
+    }
+    const cc = ns.peek(CONFIG.ports.contracts);
+    if (cc !== "NULL PORT DATA") {
+      const last = cc.recent[0] ? `; last: ${cc.recent[0].reward}` : "";
+      ns.print(`  Contracts   ${cc.solved} solved${cc.failed.length ? `, ${cc.failed.length} failed` : ""}${last}`);
+    }
+    const hn = ns.peek(CONFIG.ports.hacknet);
+    if (hn !== "NULL PORT DATA") {
+      ns.print(`  Hacknet     ${hn.nodes ?? 0} nodes, ${money(hn.income ?? 0)}/s; ${hn.note}`);
     }
     if (sing !== "NULL PORT DATA") {
       if (sing.home) ns.print(`  Home RAM    ${sing.home.note}${sing.home.cost && isFinite(sing.home.cost) ? ` (next ${f.ram(sing.home.ram)} for ${money(sing.home.cost)})` : ""}`);
