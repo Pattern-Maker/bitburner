@@ -837,10 +837,22 @@ function tickContext(ns, st) {
   return { player: st.useFormulas ? ns.getPlayer() : null, times: new Map(), level: ns.getHackingLevel() };
 }
 
-function times(ns, ctx, t) {
+/**
+ * Operation times at minimum security, which is what batch workers get (they
+ * wait for security to come back down before starting). The live values
+ * are read at whatever security the target has right now, and between a
+ * batch's grow and weaken landing that's far above minimum, so they'd be
+ * up to ~50% too long and workers would launch (and hold RAM) far too early.
+ * The game's time is proportional to 2.5 x required level x security + 500,
+ * so the live value scales exactly to minimum security.
+ */
+function times(ns, ctx, t, m) {
   let v = ctx.times.get(t);
   if (!v) {
-    v = { hack: ns.getHackTime(t), grow: ns.getGrowTime(t), weaken: ns.getWeakenTime(t) };
+    const sec = ns.getServerSecurityLevel(t);
+    const req = (m.req ??= ns.getServerRequiredHackingLevel(t));
+    const k = sec > m.minSec ? (2.5 * req * m.minSec + 500) / (2.5 * req * sec + 500) : 1;
+    v = { hack: ns.getHackTime(t) * k, grow: ns.getGrowTime(t) * k, weaken: ns.getWeakenTime(t) * k };
     ctx.times.set(t, v);
   }
   return v;
@@ -928,7 +940,7 @@ function stepLane(ns, cfg, st, ledger, lane, now, b, TICK, ctx) {
   const plan = lane.plan;
   if (!plan) return 0;
   const m = lane.m;
-  const tm = times(ns, ctx, t);
+  const tm = times(ns, ctx, t, m);
   const s = st.spacing;
   const gaps = batchGaps(m);
   const P = Math.max(plan.P, gaps * s);
