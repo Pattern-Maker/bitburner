@@ -320,20 +320,44 @@ function finishPlan(ns, cfg, st, ledger) {
   const now = Date.now();
   const b = P.b;
   const alloc = P.cands.map(() => 0); // chunks per candidate
+  const capped = P.cands.map(() => false);
   let left = P.K;
-  while (left > 0) {
-    let best = null;
+  const allocate = () => {
+    while (left > 0) {
+      let best = null;
+      P.cands.forEach((c, i) => {
+        if (capped[i]) return;
+        const a = alloc[i];
+        const base = c.curve[a] ?? 0;
+        for (let j = 1; j <= left && a + j <= P.K; j++) {
+          const gain = ((c.curve[a + j] ?? 0) - base) / j;
+          if (gain > 0 && (!best || gain > best.gain)) best = { i, j, gain };
+        }
+      });
+      if (!best) break; // nobody gains from more threads
+      alloc[best.i] += best.j;
+      left -= best.j;
+    }
+  };
+  allocate();
+  // A target that still has to prep only uses its prep threads until it's
+  // ready (then a replan gives it its batching share). Hand the rest to the
+  // other targets meanwhile, so several prep at once and ready ones batch,
+  // instead of everything waiting behind one big target's prep.
+  for (let pass = 0; pass < P.cands.length; pass++) {
+    let freed = 0;
     P.cands.forEach((c, i) => {
-      const a = alloc[i];
-      const base = c.curve[a] ?? 0;
-      for (let j = 1; j <= left && a + j <= P.K; j++) {
-        const gain = ((c.curve[a + j] ?? 0) - base) / j;
-        if (gain > 0 && (!best || gain > best.gain)) best = { i, j, gain };
+      if (capped[i] || c.ready || alloc[i] === 0) return;
+      const keep = Math.max(1, Math.ceil(c.need.total / P.chunk));
+      capped[i] = true;
+      if (alloc[i] > keep) {
+        freed += alloc[i] - keep;
+        alloc[i] = keep;
       }
     });
-    if (!best) break; // nobody gains from more threads
-    alloc[best.i] += best.j;
-    left -= best.j;
+    if (freed === 0) break;
+    left += freed;
+    allocate();
   }
 
   const order = P.cands.map((c, i) => ({ c, B: Math.floor(alloc[i] * P.chunk), v: c.curve[alloc[i]] ?? 0 })).sort((x, y) => y.v - x.v);
@@ -398,6 +422,14 @@ function finishPlan(ns, cfg, st, ledger) {
   const slotsUsed = P.maxInFlight - inFlightLeft;
   const limit = slotsUsed >= 0.9 * P.maxInFlight ? "slots" : left > 0 ? "targets" : "ram";
   const saturated = P.cands.filter((c, i) => alloc[i] > 0 && (c.curve[alloc[i] + 1] ?? c.curve[alloc[i]]) <= c.curve[alloc[i]] * (1 + 1e-9)).length;
+  // Targets that would earn if they were prepped but didn't get threads this
+  // time (usually because the best one needs prepping first and takes the
+  // lot). Prep is cheap in threads, so spare RAM preps them meanwhile and the
+  // next plan can spread out instead of waiting a whole prep for each.
+  st.prepNext = P.cands
+    .filter((c) => !c.ready && !keep.has(c.t) && (c.curve[P.K] ?? 0) > 0)
+    .sort((a, c) => c.curve[P.K] - a.curve[P.K])
+    .map((c) => ({ t: c.t, m: c.m, need: c.need }));
   st.usage = { used, capacity: st.capacity, slotsUsed, slots: P.maxInFlight, limit, targets: order.filter((x) => x.B >= 1).length, considered: P.cands.length, saturated };
 
   // Replan once per pipeline cycle (the shortest weaken time among lanes),
@@ -497,7 +529,10 @@ function startSharing(ns, cfg, st, ledger) {
   let spareThreads = st.usage.capacity - needed - st.share.reserve * st.usage.capacity;
   // Split it between hacking XP and faction rep.
   const use = spareUse(ns, cfg, st);
-  // When it isn't levelling you up, spare RAM first preps the next server
+  // Spare RAM first preps the targets this plan would use if they were
+  // ready: that's what turns into income soonest.
+  spareThreads = prepRunnersUp(ns, st, spareThreads);
+  // When it isn't levelling you up, spare RAM then preps the next server
   // you can't hack yet (weaken and grow only need root), so it batches the
   // moment your level reaches it. While XP is on, levelling gets you there
   // sooner than prepping saves, so XP comes first.
@@ -548,7 +583,7 @@ function startPrePrep(ns, st, spare) {
   // Only the next server you'll reach: further ones have much longer
   // weaken times now than they will once your level is near them, so
   // prepping them early ties up RAM that levels you faster as XP.
-  for (const lane of st.lanes.values()) if (lane.pre) return spare;
+  for (const lane of st.lanes.values()) if (lane.pre && lane.req > 0) return spare;
   const locked = st.hosts
     .filter((h) => h !== "home" && !h.startsWith("hacknet-") && !st.lanes.has(h) && ns.hasRootAccess(h) && ns.getServerMaxMoney(h) > 0)
     .map((h) => ({ h, req: ns.getServerRequiredHackingLevel(h) }))
@@ -571,6 +606,27 @@ function startPrePrep(ns, st, spare) {
     st.modeLog.push({ at: Date.now(), target: h, from: "-", to: "prep", why: `pre-prep: unlocks at hacking ${req}` });
     if (st.modeLog.length > 60) st.modeLog.shift();
   }
+  return spare;
+}
+
+/** Prep the plan's runners-up (st.prepNext) with spare threads. Returns what's left. */
+function prepRunnersUp(ns, st, spare) {
+  for (const { t, m, need } of st.prepNext ?? []) {
+    if (spare < 1) break;
+    if (st.lanes.has(t) || !need || need.total < 1) continue;
+    const take = Math.floor(Math.min(need.total, spare));
+    spare -= take;
+    const lane = newLane(t, "prep");
+    lane.pre = true;
+    lane.req = 0;
+    lane.m = m;
+    lane.prepBudget = take;
+    lane.budget = take;
+    st.lanes.set(t, lane);
+    st.modeLog.push({ at: Date.now(), target: t, from: "-", to: "prep", why: "prepping a runner-up while the plan's targets prep" });
+    if (st.modeLog.length > 60) st.modeLog.shift();
+  }
+  st.prepNext = [];
   return spare;
 }
 
@@ -810,9 +866,12 @@ function stepLane(ns, cfg, st, ledger, lane, now, b, TICK, ctx) {
   if (lane.mode === "prep") {
     if (lane.pids.size > 0) return 0; // a prep round is still landing
     if (isPrepped(ns, t) && lane.pre) {
-      // Ready for when your level reaches it; nothing more to do until then.
-      st.modeLog.push({ at: now, target: t, from: "prep", to: "-", why: "pre-prepped, waiting for your level" });
+      // Ready: a runner-up can be planned straight away; a locked server
+      // waits for your level.
+      const hackable = ns.getServerRequiredHackingLevel(t) <= ctx.level;
+      st.modeLog.push({ at: now, target: t, from: "prep", to: "-", why: hackable ? "prepped ahead, replanning" : "pre-prepped, waiting for your level" });
       st.lanes.delete(t);
+      if (hackable) requestReplan(st);
       return 0;
     }
     if (isPrepped(ns, t)) {
@@ -848,6 +907,7 @@ function stepLane(ns, cfg, st, ledger, lane, now, b, TICK, ctx) {
     lane.prep = shape;
     if (!shape || shape.total <= 0 || !pieces) return 0;
     const land = now + ns.getWeakenTime(t) + b;
+    lane.prepLand = land + 2 * st.spacing;
     const batch = { id: ++st.batchSeq, cancelled: false, launched: new Set(), land };
     const s = st.spacing;
     // Weakens first: if the grow then fails to start, nothing is harmed.
@@ -1238,6 +1298,7 @@ function publish(ns, cfg, st, ledger, b) {
         ? { h: l.plan.h, w1: l.plan.w1, g: l.plan.g, w2: l.plan.w2, f: l.plan.f, P: l.plan.P, conc: l.plan.conc, rate: l.plan.rate, inFlight: l.plan.inFlight }
         : null,
     prep: l.mode === "prep" ? l.prep : null,
+    prepLand: l.prepLand ?? 0,
     pre: !!l.pre,
     req: l.req ?? 0,
     workers: l.pids.size,

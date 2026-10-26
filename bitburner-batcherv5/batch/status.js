@@ -107,8 +107,9 @@ function render(ns, f, money) {
         }
       } else if (l.mode === "prep" && l.prep) {
         const p = l.prep;
-        const ahead = l.pre ? `, ahead of time (you can hack it at level ${l.req})` : "";
-        ns.print(`      prepping: W${p.w1} G${p.g} W${p.w2}${p.complete ? " (last round)" : " (more rounds needed)"}${ahead}`);
+        const ahead = l.pre ? (l.req > 0 ? `, ahead of time (you can hack it at level ${l.req})` : ", ready for the next plan") : "";
+        const eta = l.prepLand > now ? `, lands in ${f.time(l.prepLand - now)}` : "";
+        ns.print(`      prepping: W${p.w1} G${p.g} W${p.w2}${p.complete ? " (last round" : " (more rounds needed"}${eta})${ahead}`);
       } else if (l.mode === "drain") {
         ns.print(`      drifted: letting ${l.workers} workers land, then re-prep${earned}`);
       } else if (l.mode === "retire") {
