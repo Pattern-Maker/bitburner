@@ -28,6 +28,7 @@ run start.js
 | `batch/hacknet.js` | Buys hacknet nodes and upgrades that pay back within 2 hours | ~7 GB |
 | `batch/hack.js`, `grow.js`, `weaken.js` | Workers | 1.85–1.9 GB per thread |
 | `batch/share.js` | Share worker: lends spare RAM to factions | 4 GB per thread |
+| `batch/xp.js` | XP worker: turns spare RAM into hacking exp | 1.75 GB per thread |
 
 All of it needs roughly 60 GB on home.
 
@@ -141,6 +142,17 @@ scripts: its extra cores make each share thread count for more. While you do fac
 1 + ln(threads)/25 (a million threads is about +55%). If batches ever need
 the RAM, they take back just what they need, and the batcher lends less from
 then on, easing back over time. Turn it off with `share.enabled`.
+
+**Hacking XP.** Early in a run your hacking level is what holds income
+back: it decides which servers you can hack, and every hack, grow and weaken
+takes time proportional to 1/(level + 50). So while some server with money
+still needs a higher level than yours (`share.use: "auto"`), spare RAM runs
+`xp.js` instead, a weaken loop on whichever server gives the most exp per
+second, and only `xpShareFraction` (10%) shares; that small slice still gets
+about four-fifths of the rep bonus, because the bonus grows with the log of
+the threads. Once nothing is level-locked, all spare RAM shares. RAM held for
+a target while it preps counts as spare too, so the first few minutes of a
+run aren't wasted. Set `share.use` to `"xp"` or `"share"` to fix the choice.
 
 **Contracts.** `contracts.js` solves every contract type in 3.0.x. Each
 solver was checked against the game's own generator and answer checker on

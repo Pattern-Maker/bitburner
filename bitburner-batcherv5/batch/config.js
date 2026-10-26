@@ -90,8 +90,22 @@ export const CONFIG = {
   // ns.share(), which multiplies faction rep gain while you work for one by
   // 1 + ln(threads) / 25 (1 million threads is about +55%). reserveFraction of
   // your threads is always kept free so batches never wait for RAM.
+  // RAM the plan can't use right now (spare RAM, plus RAM held back for a
+  // target while it preps) is lent out, and taken back when batches need it.
   share: {
     enabled: true,
+    // What spare RAM does:
+    //   "auto"  hacking XP while servers with money still need a higher
+    //           hacking level than yours (levels unlock better targets and
+    //           make every operation faster), keeping xpShareFraction of it
+    //           sharing; once nothing is level-locked, all of it shares.
+    //   "xp"    always hacking XP (keeping xpShareFraction sharing)
+    //   "share" always faction rep (ns.share)
+    use: "auto",
+    // Share's rep bonus grows with the log of the threads, so a small slice
+    // gets most of it: 10% of the spare RAM gives about four-fifths of the
+    // bonus that all of it would.
+    xpShareFraction: 0.1,
     reserveFraction: 0.1,
     // Once home is at most this share of all your RAM, home stops batching
     // and shares instead (its cores make each share thread worth more).
@@ -132,5 +146,6 @@ export const CONFIG = {
     grow: "batch/grow.js",
     weaken: "batch/weaken.js",
     share: "batch/share.js",
+    xp: "batch/xp.js",
   },
 };

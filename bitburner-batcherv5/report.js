@@ -47,6 +47,7 @@ export async function main(ns) {
     if (b.planStats) out(`  planner ${b.planStats.targets} targets, ${b.planStats.ms} ms over ${b.planStats.ticks} ticks`);
     if (b.stalls?.count) out(`  stalls ${b.stalls.count}, last ${Math.round(b.stalls.lastMs / 1000)}s long, ${Math.round((now - b.stalls.lastAt) / 1000)}s ago`);
     if (b.share) out(`  sharing ${num(b.share.threads)} threads, rep x${b.share.power.toFixed(3)}, reserve ${(b.share.reserve * 100).toFixed(0)}%, reclaims ${b.share.reclaims}`);
+    if (b.share) out(`  spare RAM use: ${b.share.use ?? "share"} (${b.share.why ?? "-"}); XP ${num(b.share.xpThreads ?? 0)} threads on ${b.share.xpTarget ?? "-"}, level ${b.level ?? "?"}`);
     if (b.lastError) out(`  last error ${Math.round((now - b.lastError.at) / 1000)}s ago on ${b.lastError.target}: ${b.lastError.message}`);
     out(`  session $${num(s.money)} in ${ns.format.time(secs * 1000)} ($${num(s.money / secs)}/s), batches ${s.batches}, re-preps ${s.desyncs}, late hacks skipped ${s.aborted}`);
     let expected = 0;

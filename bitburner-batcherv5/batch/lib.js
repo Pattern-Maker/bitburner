@@ -208,6 +208,7 @@ export class Ledger {
 
 function kindOf(filename) {
   if (filename.endsWith("share.js")) return "share";
+  if (filename.endsWith("xp.js")) return "xp";
   if (filename.endsWith("hack.js")) return "hack";
   if (filename.endsWith("grow.js")) return "grow";
   return "weaken";

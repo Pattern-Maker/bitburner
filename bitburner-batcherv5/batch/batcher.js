@@ -36,6 +36,7 @@ export async function main(ns) {
     grow: ns.getScriptRam(W.grow, "home"),
     weaken: ns.getScriptRam(W.weaken, "home"),
     share: W.share ? ns.getScriptRam(W.share, "home") : 0,
+    xp: W.xp ? ns.getScriptRam(W.xp, "home") : 0,
   };
   const port = cfg.ports.reports;
   ns.clearPort(port);
@@ -69,9 +70,12 @@ export async function main(ns) {
     // timing, so their lateness is ignored.
     lastStallAt: 0,
     stalls: { count: 0, lastMs: 0, lastAt: 0 },
-    // pids: pid -> { host, threads }. reserve: share of threads kept unlent;
-    // it grows each time batches had to reclaim shared RAM, and eases back.
-    share: { pids: new Map(), threads: 0, reserve: cfg.share?.reserveFraction ?? 0.1, reclaims: 0 },
+    // Spare RAM lent out. pids: pid -> { host, threads, kind: "share" | "xp",
+    // target (xp), home }. reserve: share of threads kept unlent; it grows
+    // each time batches had to reclaim lent RAM unexpectedly, and eases back.
+    // graceUntil: a target just finished prepping and is filling its
+    // pipeline, so reclaims until then are expected and don't grow the reserve.
+    share: { pids: new Map(), threads: 0, xpThreads: 0, xpTarget: null, xpRate: 0, use: "share", why: "", reserve: cfg.share?.reserveFraction ?? 0.1, reclaims: 0, graceUntil: 0 },
     // Script cap, tuned at runtime (see tuneSlots).
     slots: { cap: cfg.maxWorkerScripts, phase: "idle", before: null, cooldown: 0, history: [] },
     drifts: [], // recent drifts, for report.js
@@ -461,8 +465,8 @@ function tuneSlots(ns, cfg, st) {
 function startSharing(ns, cfg, st, ledger) {
   const W = cfg.workers;
   if (!cfg.share?.enabled || !W.share || !st.usage) return;
-  const shareRam = ledger.scriptRam.share;
-  if (!(shareRam > 0)) return;
+  const R = ledger.scriptRam;
+  if (!(R.share > 0)) return;
   // What every lane needs: the larger of its plan and what its workers hold
   // right now (batches from the previous plan, or a target that's draining).
   const held = new Map();
@@ -471,50 +475,158 @@ function startSharing(ns, cfg, st, ledger) {
   for (const lane of st.lanes.values()) {
     const h = held.get(lane.target) ?? 0;
     if (lane.mode === "batch" && lane.plan) needed += Math.max(lane.plan.conc, h);
-    // A draining target will want its whole budget again once it re-preps.
-    else if (lane.mode === "prep" || lane.mode === "drain") needed += Math.max(lane.budget ?? lane.prepBudget ?? 0, h);
+    // A prepping target only needs its prep rounds until it's ready; the
+    // rest of its budget is lent meanwhile and taken back when it starts
+    // batching. A draining one will re-prep with its prep budget.
+    else if (lane.mode === "prep" || lane.mode === "drain") needed += Math.max(lane.prepBudget ?? 0, h);
     else needed += h;
   }
   // Ease the reserve back towards the configured level after a quiet plan.
   st.share.reserve = Math.max(cfg.share.reserveFraction, st.share.reserve * 0.9);
   const spareThreads = st.usage.capacity - needed - st.share.reserve * st.usage.capacity;
   const wantRam = Math.max(0, spareThreads * ledger.threadRam);
-  // Forget share workers that have ended (killed by hand, say), and stop
+
+  // Split it between hacking XP and faction rep.
+  const use = spareUse(ns, cfg, st);
+  const xpTarget = use.xp > 0 && R.xp > 0 ? pickXpTarget(ns, st) : null;
+  const want = { xp: xpTarget ? wantRam * use.xp : 0 };
+  want.share = wantRam - want.xp;
+  st.share.use = xpTarget ? "xp" : "share";
+  st.share.why = use.why;
+  st.share.xpTarget = xpTarget;
+
+  // Forget lent workers that have ended (killed by hand, say), and stop
   // home's share if home is batching again.
   ledger.refresh(st.hosts);
   for (const [pid, info] of [...st.share.pids]) {
     const gone = !ns.isRunning(pid);
     if (gone || (info.home && !ledger.homeDedicated)) {
       if (!gone) ns.kill(pid);
-      st.share.pids.delete(pid);
-      st.share.threads -= info.threads;
-      if (info.home) st.share.homeThreads = Math.max(0, (st.share.homeThreads ?? 0) - info.threads);
+      forgetLent(st, pid, info);
     }
   }
-  // Top up or trim what's already shared, rather than restarting it.
-  let haveRam = 0;
-  for (const info of st.share.pids.values()) if (!info.home) haveRam += info.threads * shareRam;
-  if (haveRam > wantRam + shareRam) {
-    stopSharing(ns, st, haveRam - wantRam, shareRam);
-    haveRam = 0;
-    for (const info of st.share.pids.values()) if (!info.home) haveRam += info.threads * shareRam;
+  // Top up or trim what's already lent, rather than restarting it.
+  const haveRam = (kind) => {
+    let r = 0;
+    for (const info of st.share.pids.values()) if (!info.home && (info.kind ?? "share") === kind) r += info.threads * R[kind];
+    return r;
+  };
+  for (const kind of ["share", "xp"]) {
+    const have = haveRam(kind);
+    if (have > want[kind] + R[kind]) stopSharing(ns, st, R, have - want[kind], kind, xpTarget);
   }
   ledger.refresh(st.hosts);
-  if (ledger.homeDedicated) shareHome(ns, cfg, st, shareRam);
-  let ramLeft = wantRam - haveRam;
-  if (ramLeft < shareRam) return;
-  for (const h of [...ledger.hosts].sort((a, c) => c.cores - a.cores || c.free - a.free)) {
-    const t = Math.floor(Math.min(h.free, ramLeft) / shareRam);
-    if (t < 1) continue;
-    const pid = ns.exec(W.share, h.host, { threads: t, temporary: true });
-    if (pid > 0) {
-      st.share.pids.set(pid, { host: h.host, threads: t });
-      st.share.threads += t;
-      h.free -= t * shareRam;
-      ramLeft -= t * shareRam;
-    }
-    if (ramLeft < shareRam) break;
+  if (ledger.homeDedicated) shareHome(ns, cfg, st, R.share);
+  const hosts = [...ledger.hosts].sort((a, c) => c.cores - a.cores || c.free - a.free);
+  // Share threads go where the cores are (they count for more there); XP
+  // threads get no core bonus, so they take what's left.
+  lend(ns, st, hosts, "share", W.share, R.share, want.share - haveRam("share"), [], 1);
+  if (xpTarget) {
+    // In pieces, so a batch that needs RAM back can take a small piece
+    // instead of losing a whole server's worth of exp in flight.
+    const pieces = Math.max(1, Math.ceil(want.xp / R.xp / 32));
+    lend(ns, st, hosts, "xp", W.xp, R.xp, want.xp - haveRam("xp"), [xpTarget], pieces);
   }
+  st.share.xpRate = xpRate(ns, st, ledger);
+}
+
+/** Start lent workers of one kind on free RAM, up to ramWanted. */
+function lend(ns, st, hosts, kind, script, ram, ramWanted, args, pieceThreads) {
+  let ramLeft = ramWanted;
+  for (const h of hosts) {
+    while (ramLeft >= ram) {
+      let t = Math.floor(Math.min(h.free, ramLeft) / ram);
+      if (t < 1) break;
+      if (kind === "xp") t = Math.min(t, pieceThreads);
+      const pid = ns.exec(script, h.host, { threads: t, temporary: true }, ...args);
+      if (!(pid > 0)) break;
+      st.share.pids.set(pid, { host: h.host, threads: t, kind, target: args[0] });
+      if (kind === "xp") st.share.xpThreads += t;
+      else st.share.threads += t;
+      h.free -= t * ram;
+      ramLeft -= t * ram;
+    }
+    if (ramLeft < ram) break;
+  }
+}
+
+function forgetLent(st, pid, info) {
+  st.share.pids.delete(pid);
+  if ((info.kind ?? "share") === "xp") st.share.xpThreads = Math.max(0, st.share.xpThreads - info.threads);
+  else st.share.threads = Math.max(0, st.share.threads - info.threads);
+  if (info.home) st.share.homeThreads = Math.max(0, (st.share.homeThreads ?? 0) - info.threads);
+}
+
+/**
+ * How much of the spare RAM goes to hacking XP (the rest shares), and why.
+ * In "auto", XP while some server with money still needs a higher hacking
+ * level than yours: levels unlock those targets, and every operation gets
+ * faster as your level rises. Once nothing is level-locked, rep is the
+ * better use.
+ */
+function spareUse(ns, cfg, st) {
+  const mode = cfg.share.use ?? "share";
+  const keepShare = Math.min(1, Math.max(0, cfg.share.xpShareFraction ?? 0.1));
+  if (mode === "share") return { xp: 0, why: "share.use is \"share\"" };
+  if (mode === "xp") return { xp: 1 - keepShare, why: "share.use is \"xp\"" };
+  const level = ns.getHackingLevel();
+  let locked = 0;
+  let next = Infinity;
+  for (const host of st.hosts) {
+    if (host === "home" || host.startsWith("hacknet-")) continue;
+    if (ns.getServerMaxMoney(host) <= 0) continue;
+    const req = ns.getServerRequiredHackingLevel(host);
+    if (req > level) {
+      locked++;
+      next = Math.min(next, req);
+    }
+  }
+  if (locked === 0) return { xp: 0, why: "no server is locked behind your hacking level" };
+  return { xp: 1 - keepShare, why: `${locked} servers need a higher hacking level (next at ${next})` };
+}
+
+/**
+ * The server where a weaken thread earns the most exp per second: exp per
+ * thread is 3 + 0.3 x its base security, and the time is its weaken time at
+ * minimum security (scaled from the current one with the game's formula,
+ * which is linear in required level x security, so no Formulas.exe needed).
+ */
+function pickXpTarget(ns, st) {
+  const level = ns.getHackingLevel();
+  let best = null;
+  let current = null;
+  for (const host of st.hosts) {
+    if (host === "home" || host.startsWith("hacknet-")) continue;
+    if (!ns.hasRootAccess(host) || ns.getServerMaxMoney(host) <= 0) continue;
+    const req = ns.getServerRequiredHackingLevel(host);
+    if (req > level) continue;
+    const sec = ns.getServerSecurityLevel(host);
+    const min = ns.getServerMinSecurityLevel(host);
+    const time = (ns.getWeakenTime(host) * (2.5 * req * min + 500)) / (2.5 * req * sec + 500);
+    const score = (3 + 0.3 * ns.getServerBaseSecurityLevel(host)) / time;
+    if (!best || score > best.score) best = { host, score };
+    if (host === st.share.xpTarget) current = score;
+  }
+  // Stay put unless the new one is clearly better: switching loses the exp
+  // of workers in flight on the old one as they're replaced.
+  if (best && current !== null && current * 1.1 >= best.score) return st.share.xpTarget;
+  return best?.host ?? null;
+}
+
+/** Hacking exp per ms the XP workers give, for level prediction (Formulas.exe only). */
+function xpRate(ns, st, ledger) {
+  if (!st.useFormulas || st.share.xpThreads <= 0) return 0;
+  const p = ns.getPlayer();
+  const byTarget = new Map();
+  for (const info of st.share.pids.values()) if (info.kind === "xp") byTarget.set(info.target, (byTarget.get(info.target) ?? 0) + info.threads);
+  let rate = 0;
+  for (const [t, threads] of byTarget) {
+    const s = ns.getServer(t);
+    if (!s || s.purchasedByPlayer) continue;
+    s.hackDifficulty = s.minDifficulty;
+    rate += (ns.formulas.hacking.hackExp(s, p) * threads) / ns.formulas.hacking.weakenTime(s, p);
+  }
+  return rate;
 }
 
 /**
@@ -528,26 +640,43 @@ function shareHome(ns, cfg, st, shareRam) {
   if (t < 1) return;
   const pid = ns.exec(cfg.workers.share, "home", { threads: t, temporary: true });
   if (pid > 0) {
-    st.share.pids.set(pid, { host: "home", threads: t, home: true });
+    st.share.pids.set(pid, { host: "home", threads: t, home: true, kind: "share" });
     st.share.threads += t;
     st.share.homeThreads = (st.share.homeThreads ?? 0) + t;
   }
 }
 
-/** Take shared RAM back: all of it, or (with ramNeeded) just enough, biggest first. */
-function stopSharing(ns, st, ramNeeded = Infinity, shareRam = 0) {
-  let freed = 0;
+/**
+ * Take lent RAM back: all of it, or (with ramNeeded) just enough. With a
+ * kind, only that kind; XP workers not on the current XP target go first.
+ * Otherwise the smallest single worker that covers the need, or the biggest
+ * ones until it's covered, so as little as possible is stopped.
+ */
+function stopSharing(ns, st, R, ramNeeded = Infinity, kind = null, xpTarget = null) {
+  const ramOf = (info) => info.threads * (R[info.kind ?? "share"] ?? 0);
   // A partial reclaim never touches home's dedicated share: batches can't use home then.
-  const byBiggest = [...st.share.pids.entries()].filter(([, i]) => ramNeeded === Infinity || !i.home).sort((a, c) => c[1].threads - a[1].threads);
-  for (const [pid, info] of byBiggest) {
-    if (freed >= ramNeeded) break;
-    if (info.home) st.share.homeThreads = Math.max(0, (st.share.homeThreads ?? 0) - info.threads);
-    ns.kill(pid);
-    st.share.pids.delete(pid);
-    st.share.threads -= info.threads;
-    freed += info.threads * shareRam;
+  let list = [...st.share.pids.entries()].filter(([, i]) => (ramNeeded === Infinity || !i.home) && (!kind || (i.kind ?? "share") === kind));
+  if (ramNeeded !== Infinity) {
+    const bigFirst = (a, c) => ramOf(c[1]) - ramOf(a[1]);
+    const isStale = ([, i]) => i.kind === "xp" && xpTarget && i.target !== xpTarget;
+    const stale = list.filter(isStale);
+    if (stale.length) list = [...stale.sort(bigFirst), ...list.filter((e) => !isStale(e)).sort(bigFirst)];
+    else {
+      const cover = list.filter(([, i]) => ramOf(i) >= ramNeeded).sort((a, c) => ramOf(a[1]) - ramOf(c[1]))[0];
+      list = cover ? [cover] : list.sort(bigFirst);
+    }
   }
-  if (st.share.pids.size === 0) st.share.threads = 0;
+  let freed = 0;
+  for (const [pid, info] of list) {
+    if (freed >= ramNeeded) break;
+    ns.kill(pid);
+    forgetLent(st, pid, info);
+    freed += ramOf(info);
+  }
+  if (st.share.pids.size === 0) {
+    st.share.threads = 0;
+    st.share.xpThreads = 0;
+  }
 }
 
 /** Change a lane's mode, keeping a short log of why (for report.js). */
@@ -630,6 +759,9 @@ function stepLane(ns, cfg, st, ledger, lane, now, b, TICK, ctx) {
     if (lane.pids.size > 0) return 0; // a prep round is still landing
     if (isPrepped(ns, t)) {
       setMode(st, lane, "batch", "prepped");
+      // Its budget was lent out while it prepped; taking it back as the
+      // pipeline fills is expected, not a sign of lending too much.
+      st.share.graceUntil = Math.max(st.share.graceUntil, now + ns.getWeakenTime(t) + 2 * b);
       lane.firstLand = 0;
       lane.plan = null;
       lane.prep = null;
@@ -800,7 +932,8 @@ function predictPct(ns, st, lane, ctx, L, pctNow) {
     // All exp still in flight. Some of it lands after L (other targets with
     // longer weakens), which slightly overstates the level: that only makes
     // the grow a little bigger, which is the safe direction.
-    const pending = st.pendingExpTotal;
+    // Plus what the XP workers will have added by then.
+    const pending = st.pendingExpTotal + st.share.xpRate * Math.max(0, L - Date.now());
     const sk = ns.formulas.skills;
     const gain = sk.calculateSkill(p.exp.hacking + pending, p.mults.hacking) - sk.calculateSkill(p.exp.hacking, p.mults.hacking);
     // One level of headroom: a level-up the prediction just misses then costs
@@ -835,8 +968,10 @@ function launch(ns, cfg, st, ledger, lane, op) {
     // Shared RAM is lent, not given: take back what this needs (with some
     // room to spare), lend less from now on, and try once more.
     const need = op.amount * ledger.scriptRam[kind] * 2;
-    stopSharing(ns, st, need, ledger.scriptRam.share);
-    st.share.reserve = Math.min(0.5, st.share.reserve * 1.5);
+    stopSharing(ns, st, ledger.scriptRam, need);
+    // Expected while a just-prepped target fills its pipeline (its budget
+    // was lent during the prep); otherwise lend less from now on.
+    if (Date.now() > st.share.graceUntil) st.share.reserve = Math.min(0.5, st.share.reserve * 1.5);
     st.share.reclaims++;
     ledger.refresh(st.hosts);
     pieces = ledger.plan(kind, op.amount);
@@ -1051,7 +1186,19 @@ function publish(ns, cfg, st, ledger, b) {
     planStats: st.planStats ?? null,
     planning: !!st.planner,
     lastError: st.lastError ?? null,
-    share: { threads: st.share.threads, homeThreads: st.share.homeThreads ?? 0, homeDedicated: ledger.homeDedicated, power: ns.getSharePower(), reserve: st.share.reserve, reclaims: st.share.reclaims },
+    share: {
+      threads: st.share.threads,
+      homeThreads: st.share.homeThreads ?? 0,
+      homeDedicated: ledger.homeDedicated,
+      power: ns.getSharePower(),
+      reserve: st.share.reserve,
+      reclaims: st.share.reclaims,
+      use: st.share.use,
+      why: st.share.why,
+      xpThreads: st.share.xpThreads,
+      xpTarget: st.share.xpTarget,
+    },
+    level: ns.getHackingLevel(),
     modeLog: st.modeLog.slice(-20),
     incomeLog: st.incomeLog,
     usage: st.usage ?? null,

@@ -55,6 +55,10 @@ function render(ns, f, money) {
     if (b.share) {
       const sh = b.share;
       const homeNote = sh.homeDedicated ? ` (home dedicated: ${f.number(sh.homeThreads ?? 0, 0)})` : "";
+      if (sh.xpThreads > 0) {
+        ns.print(`  XP          ${f.number(sh.xpThreads, 0)} spare threads weakening ${sh.xpTarget ?? "?"} for hacking exp (level ${b.level ?? "?"})`);
+        if (sh.why) ns.print(`              ${sh.why}`);
+      }
       if (sh.threads > 0) ns.print(`  Sharing     ${f.number(sh.threads, 0)} spare threads${homeNote}: faction rep x${sh.power.toFixed(3)} while you work for a faction`);
       else if (sh.reserve > 0.11) ns.print(`  Sharing     holding back ${f.percent(sh.reserve, 0)} of threads after batches needed RAM`);
     }
