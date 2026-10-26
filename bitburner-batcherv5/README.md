@@ -14,6 +14,7 @@ run start.js
 | `cleanup.js` | Removes leftover scripts from every server | ~3 GB |
 | `update.js` | Downloads the latest scripts from the GitHub repo | ~6 GB |
 | `report.js` | Writes a diagnostics report to paste to Claude | ~3 GB |
+| `backdoor.js` | Backdoors everything by typing into the terminal (no Source-File 4 needed) | ~30 GB |
 | `batch/config.js` | Your preferences (home reserve, script cap, ports) | – |
 | `batch/lib.js` | Scanning, rooting, RAM ledger, model and solvers | – |
 | `batch/crawler.js` | Roots servers every 30 s and copies workers out | ~5 GB |
@@ -127,12 +128,19 @@ so a bad solver can't destroy contracts.
 **Hacknet.** `hacknet.js` buys whatever adds the most income per dollar, but
 only if it pays for itself within `hacknet.paybackHours`.
 
+**Backdoors without Source-File 4.** `run backdoor.js` types
+`home; connect ...; backdoor` into the terminal for each server, faction
+servers first. Keep the Terminal screen open; it waits whenever you're
+typing or the terminal is busy, and stops when everything is done. The game
+charges 25 GB of RAM for touching its page. A game update that changes the
+terminal could break it; it says so if that happens.
+
 **Diagnostics.** `run report.js` prints everything the suite knows about how
 it's doing (and saves it to `report.txt`) for pasting into a chat with Claude.
 
 ## What's left to you
 
-Buying TOR, port openers and Formulas.exe, and (without Source-File 4) home
-RAM, backdoors, training and faction work: the game only lets scripts do
+Buying TOR, port openers and Formulas.exe, running `backdoor.js` now and
+then, and (without Source-File 4) home RAM, training and faction work: the game only lets scripts do
 those through Singularity. The status window says what to buy next and gives the exact
 `connect` path for each backdoor.

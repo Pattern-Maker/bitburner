@@ -44,8 +44,11 @@ function render(ns, f, money) {
     if (b.usage && b.usage.capacity > 0) {
       const u = b.usage;
       ns.print(`  In use      ${f.percent(u.used / u.capacity, 0)} of threads, ${f.number(u.slotsUsed, 0)} / ${f.number(u.slots, 0)} batch slots`);
-      if (u.slotsUsed >= 0.9 * u.slots && u.used < 0.9 * u.capacity) {
-        ns.print(`              slots are the limit, not RAM: raise maxWorkerScripts if lateness stays low`);
+      if (u.limit === "slots") {
+        ns.print(`              limit: script slots. Raise maxWorkerScripts if lateness stays low`);
+      } else if (u.limit === "targets") {
+        ns.print(`              limit: targets. All ${u.considered} considered targets get every thread that still adds income`);
+        ns.print(`              (each can land one batch per 4 landing gaps); the rest is lent to factions`);
       }
     }
     if (b.share) {

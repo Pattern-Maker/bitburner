@@ -356,7 +356,13 @@ function finishPlan(ns, cfg, st, ledger) {
     if (!keep.has(lane.target)) continue;
     used += lane.mode === "batch" && lane.plan ? lane.plan.conc : lane.budget ?? 0;
   }
-  st.usage = { used, capacity: st.capacity, slotsUsed: P.maxInFlight - inFlightLeft, slots: P.maxInFlight };
+  // Why the plan stopped where it did: every considered target already gets
+  // all the threads that still add income (saturated), the script slots ran
+  // out, or the RAM did.
+  const slotsUsed = P.maxInFlight - inFlightLeft;
+  const limit = slotsUsed >= 0.9 * P.maxInFlight ? "slots" : left > 0 ? "targets" : "ram";
+  const saturated = P.cands.filter((c, i) => alloc[i] > 0 && (c.curve[alloc[i] + 1] ?? c.curve[alloc[i]]) <= c.curve[alloc[i]] * (1 + 1e-9)).length;
+  st.usage = { used, capacity: st.capacity, slotsUsed, slots: P.maxInFlight, limit, targets: order.filter((x) => x.B >= 1).length, considered: P.cands.length, saturated };
 
   // Replan once per pipeline cycle (the shortest weaken time among lanes),
   // or straight away if something asked for one while this plan was built.

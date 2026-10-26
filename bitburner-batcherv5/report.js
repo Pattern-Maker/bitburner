@@ -40,7 +40,7 @@ export async function main(ns) {
     const secs = Math.max(1, (now - s.start) / 1000);
     out(`Batcher (updated ${age(b)}):`);
     out(`  RAM ${ns.format.ram(b.totalRam)} on ${b.hosts} servers = ${num(b.capacity)} threads; workers ${b.workers}/${b.maxWorkers}`);
-    if (b.usage) out(`  plan uses ${((b.usage.used / Math.max(1, b.usage.capacity)) * 100).toFixed(1)}% of threads, slots ${b.usage.slotsUsed}/${b.usage.slots}`);
+    if (b.usage) out(`  plan uses ${((b.usage.used / Math.max(1, b.usage.capacity)) * 100).toFixed(1)}% of threads, slots ${b.usage.slotsUsed}/${b.usage.slots}, limit: ${b.usage.limit ?? "?"} (${b.usage.targets ?? "?"} of ${b.usage.considered ?? "?"} targets used, ${b.usage.saturated ?? "?"} saturated)`);
     out(`  gap ${b.spacing} ms, buffer ${b.buffer} ms`);
     if (b.lateStats) out(`  lateness p50 ${b.lateStats.p50} ms, p99 ${b.lateStats.p99} ms, max ${b.lateStats.max} ms (n=${b.lateStats.n})`);
     if (b.planStats) out(`  planner ${b.planStats.targets} targets, ${b.planStats.ms} ms over ${b.planStats.ticks} ticks`);

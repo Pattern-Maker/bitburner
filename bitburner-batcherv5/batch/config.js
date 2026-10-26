@@ -27,7 +27,7 @@ export const CONFIG = {
   switchPaybackCycles: 10,
 
   // How many of the most promising targets the planner considers each replan.
-  maxTargets: 15,
+  maxTargets: 30,
   // How finely the planner divides your threads when sharing them between
   // targets (60 = steps of 1/60th). Higher is more precise but slower to plan.
   planChunks: 60,
